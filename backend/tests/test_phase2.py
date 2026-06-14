@@ -43,6 +43,14 @@ async def register_and_login(client, email: str) -> str:
 @pytest.mark.asyncio
 async def test_valid_playlist_url_creates_course_and_videos(client, monkeypatch):
     monkeypatch.setattr("app.services.ingestion._extract_youtube_info", lambda url: playlist_info())
+    dispatched = {}
+    monkeypatch.setattr(
+        "app.api.v1.courses.dispatch_course_tasks.delay",
+        lambda course_id, user_id: dispatched.update(
+            course_id=course_id,
+            user_id=user_id,
+        ),
+    )
     token = await register_and_login(client, "phase2@example.com")
 
     response = await client.post(
@@ -63,6 +71,8 @@ async def test_valid_playlist_url_creates_course_and_videos(client, monkeypatch)
     videos = detail.json()["videos"]
     assert [video["youtube_video_id"] for video in videos] == ["video-one", "video-two"]
     assert all(video["status"] == "pending" for video in videos)
+    assert dispatched["course_id"] == course["id"]
+    assert dispatched["user_id"]
 
 
 @pytest.mark.asyncio
@@ -70,6 +80,10 @@ async def test_single_video_url_creates_single_video_course(client, monkeypatch)
     monkeypatch.setattr(
         "app.services.ingestion._extract_youtube_info",
         lambda url: {"id": "abc123", "title": "Single Lesson", "duration": 42},
+    )
+    monkeypatch.setattr(
+        "app.api.v1.courses.dispatch_course_tasks.delay",
+        lambda course_id, user_id: None,
     )
     token = await register_and_login(client, "single@example.com")
 
@@ -142,8 +156,8 @@ def test_youtube_captions_normalise_correctly(monkeypatch):
             return FakeTranscript()
 
     monkeypatch.setattr(
-        "app.services.transcript.YouTubeTranscriptApi.list_transcripts",
-        lambda video_id: FakeTranscriptList(),
+        "app.services.transcript.YouTubeTranscriptApi.list",
+        lambda self, video_id: FakeTranscriptList(),
     )
 
     transcript = fetch_youtube_captions("abc123")
@@ -202,6 +216,10 @@ async def test_transcript_validation_rejects_word_count_mismatch(db_session):
 @pytest.mark.asyncio
 async def test_user_cannot_access_another_users_course(client, monkeypatch):
     monkeypatch.setattr("app.services.ingestion._extract_youtube_info", lambda url: playlist_info())
+    monkeypatch.setattr(
+        "app.api.v1.courses.dispatch_course_tasks.delay",
+        lambda course_id, user_id: None,
+    )
     token_a = await register_and_login(client, "owner@example.com")
     token_b = await register_and_login(client, "intruder@example.com")
 
@@ -222,6 +240,10 @@ async def test_user_cannot_access_another_users_course(client, monkeypatch):
 @pytest.mark.asyncio
 async def test_delete_course_cascades(client, db_session, monkeypatch):
     monkeypatch.setattr("app.services.ingestion._extract_youtube_info", lambda url: playlist_info())
+    monkeypatch.setattr(
+        "app.api.v1.courses.dispatch_course_tasks.delay",
+        lambda course_id, user_id: None,
+    )
     token = await register_and_login(client, "delete@example.com")
     created = await client.post(
         "/api/v1/courses",

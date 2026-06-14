@@ -6,6 +6,13 @@ export function getVideo(videoId: string, accessToken: string): Promise<VideoRes
   return request<VideoResponse>(`/videos/${videoId}`, { accessToken });
 }
 
+export function retryVideo(videoId: string, accessToken: string): Promise<VideoResponse> {
+  return request<VideoResponse>(`/videos/${videoId}/retry`, {
+    method: "POST",
+    accessToken,
+  });
+}
+
 export function getVideoTranscript(
   videoId: string,
   accessToken: string,

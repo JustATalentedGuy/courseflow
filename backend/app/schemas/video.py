@@ -9,6 +9,8 @@ class VideoStatus(str, Enum):
     PENDING = "pending"
     DEFERRED = "deferred"
     PROCESSING = "processing"
+    RATE_LIMITED = "rate_limited"
+    BATCH_PROCESSING = "batch_processing"
     COMPLETED = "completed"
     FAILED = "failed"
     MANUAL = "manual"

@@ -57,9 +57,13 @@ async def test_quota_check_defers_task_when_exhausted(db_session, monkeypatch):
     user, course, video = await create_video(db_session, "phase4-quota@example.com")
     video_id = video.id
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    await redis.set(f"groq:quota:{user.id}:llm_requests", QuotaManager.DAILY_LIMITS["llm_requests"])
+    quota = QuotaManager(redis)
+    keys = quota._window_keys(settings.groq_auto_model, datetime.now(UTC))
+    await redis.set(keys[0], quota.profile(settings.groq_auto_model).rpd)
+    await redis.set(keys[1], 0)
     await redis.aclose()
     calls = {"extract": 0}
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
 
     async def fake_extract(video_obj, db):
         calls["extract"] += 1
@@ -74,7 +78,10 @@ async def test_quota_check_defers_task_when_exhausted(db_session, monkeypatch):
     refreshed = await db_session.get(Video, video_id)
     assert refreshed.status == "deferred"
     assert refreshed.scheduled_for is not None
-    assert calls["extract"] == 0
+    assert calls["extract"] == 1
+    assert await db_session.scalar(
+        select(Transcript).where(Transcript.video_id == video_id)
+    ) is not None
 
 
 @pytest.mark.asyncio
@@ -82,11 +89,16 @@ async def test_deferred_task_reschedules_at_correct_eta(db_session, monkeypatch)
     user, course, video = await create_video(db_session, "phase4-eta@example.com")
     video_id = video.id
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    await redis.set(f"groq:quota:{user.id}:llm_requests", QuotaManager.DAILY_LIMITS["llm_requests"])
+    quota = QuotaManager(redis)
+    keys = quota._window_keys(settings.groq_auto_model, datetime.now(UTC))
+    await redis.set(keys[0], quota.profile(settings.groq_auto_model).rpd)
+    await redis.set(keys[1], 0)
     await redis.aclose()
     eta = datetime.now(UTC) + timedelta(seconds=5)
     captured = {}
 
+    await patch_successful_transcript(monkeypatch, video.youtube_video_id)
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
     monkeypatch.setattr("app.tasks.video_tasks.get_next_midnight_utc", lambda: eta)
     monkeypatch.setattr(
         "app.tasks.video_tasks.process_video_task.apply_async",
@@ -105,18 +117,17 @@ async def test_deferred_task_reschedules_at_correct_eta(db_session, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_quota_incremented_after_successful_processing(db_session, monkeypatch):
+async def test_offline_processing_does_not_charge_groq_quota(db_session, monkeypatch):
     user, course, video = await create_video(db_session, "phase4-increment@example.com")
     await patch_successful_transcript(monkeypatch, video.youtube_video_id)
+    monkeypatch.setattr(settings, "groq_api_key", "your_groq_key_here")
 
     process_video_task.delay(str(video.id), str(user.id)).get()
 
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    llm_requests = int(await redis.get(f"groq:quota:{user.id}:llm_requests") or 0)
-    llm_tokens = int(await redis.get(f"groq:quota:{user.id}:llm_tokens_minute") or 0)
-    await redis.aclose()
-    assert llm_requests == 1
-    assert llm_tokens > 0
+    notes = await db_session.scalar(select(Notes).where(Notes.video_id == video.id))
+    assert notes is not None
+    assert notes.request_count == 0
+    assert notes.token_count > 0
 
 
 @pytest.mark.asyncio

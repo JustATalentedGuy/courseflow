@@ -1,11 +1,73 @@
+# Secrets and local configuration
 .env
-backend/.env
-backend/.venv/
-backend/.pytest_cache/
-backend/**/__pycache__/
-backend/celerybeat-schedule*
-frontend/node_modules/
-frontend/dist/
-*.py[cod]
+.env.*
+!.env.example
+!**/.env.example
 
+# Python environments, caches, builds, and coverage
+.venv/
+venv/
+env/
+backend/.venv/
 backend/.deps/
+**/__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+
+# Node dependencies, caches, builds, and test artifacts
+**/node_modules/
+**/.vite/
+**/dist/
+**/coverage/
+test-results/
+playwright-report/
+
+# Celery and application runtime files
+celerybeat-schedule*
+*.pid
+*.log
+logs/
+tmp/
+temp/
+backend/tmp/
+backend/temp/
+downloads/
+
+# Local databases, dumps, and service data
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+postgres_data/
+redis_data/
+minio_data/
+
+# Temporary downloaded/transcoded audio
+backend/**/*.mp3
+backend/**/*.wav
+backend/**/*.m4a
+backend/**/*.webm
+backend/**/*.opus
+
+# IDE and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import inspect
+import math
 import re
 import subprocess
 import sys
@@ -9,38 +12,40 @@ from pathlib import Path
 
 import structlog
 from groq import AsyncGroq
-from pydub import AudioSegment
-from pydub.silence import detect_silence
-from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
 from app.core.config import settings
 from app.core.exceptions import (
     PermanentAPIError,
+    GroqQuotaWaitError,
     QuotaExhaustedError,
     TemporaryAPIError,
     TranscriptExtractionError,
     TranscriptValidationError,
 )
 from app.models.transcript import Transcript
+from app.models.groq import GroqUsageEvent, WhisperTranscriptionChunk
 from app.models.video import Video
 from app.schemas.transcript import NormalisedTranscript, TranscriptSegment
 from app.services.external_api import call_external_async
+from app.services.quota import QuotaManager
 
 logger = structlog.get_logger()
 
 MAX_GROQ_FILE_BYTES = 25 * 1024 * 1024
-WHISPER_REQUEST_LIMIT = 2000
-WHISPER_SECONDS_HOUR_LIMIT = 7200
 CHUNK_OVERLAP_MS = 2000
+MAX_GROQ_CHUNK_SECONDS = 2400
 
 
 @dataclass(frozen=True)
 class AudioChunk:
     path: Path
     offset_seconds: float
+    duration_seconds: float
+    fingerprint: str
 
 
 def _collapse_spaces(text: str) -> str:
@@ -88,11 +93,19 @@ def _caption_segments_to_transcript(
     segments: list[TranscriptSegment] = []
 
     for caption in captions:
-        cleaned = clean_transcript_text(caption.get("text", ""))
+        if isinstance(caption, dict):
+            text = caption.get("text", "")
+            start_value = caption.get("start", 0)
+            duration_value = caption.get("duration", 0)
+        else:
+            text = getattr(caption, "text", "")
+            start_value = getattr(caption, "start", 0)
+            duration_value = getattr(caption, "duration", 0)
+        cleaned = clean_transcript_text(text)
         if not cleaned:
             continue
-        start = float(caption.get("start", 0))
-        duration = float(caption.get("duration", 0))
+        start = float(start_value)
+        duration = float(duration_value)
         end = start + duration
         if end <= start:
             continue
@@ -117,12 +130,13 @@ def _caption_segments_to_transcript(
 
 def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None:
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(youtube_video_id)
+        transcript_list = YouTubeTranscriptApi().list(youtube_video_id)
         try:
             transcript = transcript_list.find_manually_created_transcript(["en"])
         except NoTranscriptFound:
             transcript = transcript_list.find_generated_transcript(["en"])
-        captions = transcript.fetch()
+        fetched = transcript.fetch()
+        captions = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else list(fetched)
         source = "youtube_captions"
         language = transcript.language_code
     except NoTranscriptFound:
@@ -133,7 +147,8 @@ def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None
                 youtube_video_id=youtube_video_id,
                 language=transcript.language_code,
             )
-            captions = transcript.fetch()
+            fetched = transcript.fetch()
+            captions = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else list(fetched)
             source = "youtube_captions"
             language = transcript.language_code
         except (NoTranscriptFound, StopIteration):
@@ -150,57 +165,15 @@ def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None
 
 
 async def _ensure_whisper_quota(video: Video) -> None:
+    del video
     if not settings.groq_api_key or settings.groq_api_key == "your_groq_key_here":
         raise QuotaExhaustedError("Groq API key is not configured for Whisper fallback")
-
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        requests_key = f"groq:quota:{video.user_id}:whisper_requests"
-        seconds_key = f"groq:quota:{video.user_id}:whisper_seconds_hour"
-        request_count = int(await redis.get(requests_key) or 0)
-        seconds_count = int(await redis.get(seconds_key) or 0)
-        requested_seconds = int(video.duration_seconds or 0)
-
-        if request_count >= WHISPER_REQUEST_LIMIT:
-            raise QuotaExhaustedError("Groq Whisper request quota exhausted")
-        if seconds_count + requested_seconds > WHISPER_SECONDS_HOUR_LIMIT:
-            raise QuotaExhaustedError("Groq Whisper hourly audio-seconds quota exhausted")
-    finally:
-        await redis.aclose()
-
-
-def _seconds_until_midnight_utc() -> int:
-    now = datetime.now(UTC)
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    next_midnight = midnight + timedelta(days=1)
-    return int((next_midnight - now).total_seconds())
-
-
-async def _record_whisper_usage(video: Video, chunk_count: int) -> None:
-    redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        requests_key = f"groq:quota:{video.user_id}:whisper_requests"
-        seconds_key = f"groq:quota:{video.user_id}:whisper_seconds_hour"
-        requests = await redis.incrby(requests_key, chunk_count)
-        seconds = await redis.incrby(seconds_key, int(video.duration_seconds or 0))
-        if requests == chunk_count:
-            await redis.expire(requests_key, _seconds_until_midnight_utc())
-        if seconds == int(video.duration_seconds or 0):
-            await redis.expire(seconds_key, 3600)
-        logger.info(
-            "quota.incremented",
-            user_id=str(video.user_id),
-            key="whisper",
-            requests=chunk_count,
-            seconds=int(video.duration_seconds or 0),
-        )
-    finally:
-        await redis.aclose()
 
 
 def _download_audio(video: Video, temp_path: Path) -> Path:
     output_template = str(temp_path / f"{video.youtube_video_id}.%(ext)s")
     url = f"https://www.youtube.com/watch?v={video.youtube_video_id}"
+    timeout_seconds = _audio_download_timeout_seconds(video.duration_seconds)
     try:
         result = subprocess.run(
             [
@@ -210,7 +183,15 @@ def _download_audio(video: Video, temp_path: Path) -> Path:
                 "--quiet",
                 "--no-warnings",
                 "--format",
-                "bestaudio/best",
+                "bestaudio[abr<=96]/bestaudio/best",
+                "--socket-timeout",
+                "30",
+                "--retries",
+                "5",
+                "--fragment-retries",
+                "5",
+                "--retry-sleep",
+                "exp=1:5",
                 "--output",
                 output_template,
                 "--extract-audio",
@@ -224,13 +205,17 @@ def _download_audio(video: Video, temp_path: Path) -> Path:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_seconds,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TemporaryAPIError("YouTube audio download timed out after 30 seconds") from exc
+        raise TemporaryAPIError(
+            f"YouTube audio download timed out after {timeout_seconds} seconds"
+        ) from exc
     if result.returncode != 0:
-        raise PermanentAPIError("YouTube audio download failed")
+        detail = result.stderr.strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise PermanentAPIError(f"YouTube audio download failed{suffix}")
 
     mp3_path = temp_path / f"{video.youtube_video_id}.mp3"
     if not mp3_path.exists():
@@ -241,56 +226,149 @@ def _download_audio(video: Video, temp_path: Path) -> Path:
     return mp3_path
 
 
-def _silence_boundaries(audio: AudioSegment) -> list[int]:
-    silences = detect_silence(audio, min_silence_len=700, silence_thresh=audio.dBFS - 16)
-    return [int((start + end) / 2) for start, end in silences]
+def _audio_download_timeout_seconds(duration_seconds: int | None) -> int:
+    duration_minutes = max(1, math.ceil((duration_seconds or 0) / 60))
+    calculated = (
+        duration_minutes * settings.youtube_audio_download_timeout_seconds_per_minute
+    )
+    return max(
+        settings.youtube_audio_download_min_timeout_seconds,
+        min(settings.youtube_audio_download_max_timeout_seconds, calculated),
+    )
+
+
+def _probe_audio_duration_seconds(audio_path: Path) -> float:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TemporaryAPIError("Audio duration probe timed out after 30 seconds") from exc
+    if result.returncode != 0:
+        raise TranscriptExtractionError("Could not determine downloaded audio duration")
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise TranscriptExtractionError("Downloaded audio duration is invalid") from exc
+    if duration <= 0:
+        raise TranscriptExtractionError("Downloaded audio duration must be positive")
+    return duration
+
+
+def _extract_audio_chunk(
+    audio_path: Path,
+    chunk_path: Path,
+    start_seconds: float,
+    duration_seconds: float,
+) -> None:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start_seconds:.3f}",
+                "-i",
+                str(audio_path),
+                "-t",
+                f"{duration_seconds:.3f}",
+                "-codec",
+                "copy",
+                "-y",
+                str(chunk_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TemporaryAPIError("Audio chunk extraction timed out after 120 seconds") from exc
+    if result.returncode != 0 or not chunk_path.exists():
+        raise TranscriptExtractionError("Audio chunk extraction failed")
 
 
 def _split_audio_if_needed(audio_path: Path, temp_path: Path) -> list[AudioChunk]:
-    if audio_path.stat().st_size <= MAX_GROQ_FILE_BYTES:
-        return [AudioChunk(path=audio_path, offset_seconds=0)]
+    def audio_chunk(path: Path, offset_seconds: float, duration_seconds: float) -> AudioChunk:
+        return AudioChunk(
+            path=path,
+            offset_seconds=offset_seconds,
+            duration_seconds=duration_seconds,
+            fingerprint=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
 
-    audio = AudioSegment.from_file(audio_path)
-    bytes_per_ms = audio_path.stat().st_size / max(len(audio), 1)
-    max_ms = int((MAX_GROQ_FILE_BYTES * 0.90) / bytes_per_ms)
-    boundaries = _silence_boundaries(audio)
+    total_duration = _probe_audio_duration_seconds(audio_path)
+    if audio_path.stat().st_size <= MAX_GROQ_FILE_BYTES:
+        return [audio_chunk(audio_path, 0, total_duration)]
 
     chunks: list[AudioChunk] = []
-    start_ms = 0
+    nominal_start = 0.0
     chunk_index = 0
-    while start_ms < len(audio):
-        target_end = min(start_ms + max_ms, len(audio))
-        nearby_boundaries = [
-            boundary
-            for boundary in boundaries
-            if start_ms + 30_000 < boundary <= target_end
-        ]
-        end_ms = nearby_boundaries[-1] if nearby_boundaries else target_end
-        chunk_start = max(start_ms - CHUNK_OVERLAP_MS, 0)
-        chunk_audio = audio[chunk_start:end_ms]
+    overlap_seconds = CHUNK_OVERLAP_MS / 1000
+    while nominal_start < total_duration:
+        nominal_end = min(nominal_start + MAX_GROQ_CHUNK_SECONDS, total_duration)
+        chunk_start = max(nominal_start - overlap_seconds, 0)
+        chunk_duration = nominal_end - chunk_start
         chunk_path = temp_path / f"whisper_chunk_{chunk_index}.mp3"
-        chunk_audio.export(chunk_path, format="mp3", bitrate="64k")
-        chunks.append(AudioChunk(path=chunk_path, offset_seconds=chunk_start / 1000))
-        if end_ms >= len(audio):
-            break
-        start_ms = end_ms
+        _extract_audio_chunk(
+            audio_path,
+            chunk_path,
+            chunk_start,
+            chunk_duration,
+        )
+        if chunk_path.stat().st_size > MAX_GROQ_FILE_BYTES:
+            raise TranscriptExtractionError("Audio chunk exceeds Groq's 25 MB upload limit")
+        chunks.append(
+            audio_chunk(
+                chunk_path,
+                chunk_start,
+                chunk_duration,
+            )
+        )
+        nominal_start = nominal_end
         chunk_index += 1
 
     return chunks
 
 
-async def _transcribe_chunk(client: AsyncGroq, chunk: AudioChunk) -> list[TranscriptSegment]:
+async def _transcribe_chunk(
+    client: AsyncGroq,
+    chunk: AudioChunk,
+) -> tuple[list[TranscriptSegment], dict[str, str], str | None]:
     audio_bytes = chunk.path.read_bytes()
 
     async def create_transcription():
-        return await client.audio.transcriptions.create(
+        return await client.audio.transcriptions.with_raw_response.create(
             file=(chunk.path.name, audio_bytes),
-            model="whisper-large-v3-turbo",
+            model=settings.groq_whisper_model,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
         )
 
-    response = await call_external_async(create_transcription, "Groq Whisper")
+    raw_response = await call_external_async(
+        create_transcription,
+        "Groq Whisper",
+        passthrough_status_codes={429},
+    )
+    response = raw_response.parse()
+    if inspect.isawaitable(response):
+        response = await response
+    headers = {str(key).lower(): str(value) for key, value in raw_response.headers.items()}
     raw_segments = getattr(response, "segments", None) or []
     segments: list[TranscriptSegment] = []
     for raw_segment in raw_segments:
@@ -310,7 +388,9 @@ async def _transcribe_chunk(client: AsyncGroq, chunk: AudioChunk) -> list[Transc
             continue
         if end > start and cleaned:
             segments.append(TranscriptSegment(start=start, end=end, text=cleaned, speaker=None))
-    return segments
+    x_groq = getattr(response, "x_groq", None)
+    request_id = headers.get("x-request-id") or getattr(x_groq, "id", None)
+    return segments, headers, request_id
 
 
 def _stitch_segments(chunks: list[list[TranscriptSegment]]) -> list[TranscriptSegment]:
@@ -327,7 +407,80 @@ def _stitch_segments(chunks: list[list[TranscriptSegment]]) -> list[TranscriptSe
     return stitched
 
 
-async def transcribe_with_whisper(video: Video) -> NormalisedTranscript:
+def _error_headers(exc: Exception) -> dict[str, str]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or getattr(exc, "headers", None) or {}
+    return {str(key).lower(): str(value) for key, value in headers.items()}
+
+
+def _error_body(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    text = getattr(response, "text", "") if response is not None else ""
+    return text if isinstance(text, str) and text else str(exc)
+
+
+async def _prepare_whisper_rows(
+    db: AsyncSession,
+    video: Video,
+    chunks: list[AudioChunk],
+) -> list[WhisperTranscriptionChunk]:
+    existing = list(
+        await db.scalars(
+            select(WhisperTranscriptionChunk)
+            .where(WhisperTranscriptionChunk.video_id == video.id)
+            .order_by(WhisperTranscriptionChunk.chunk_index)
+        )
+    )
+    if len(existing) != len(chunks):
+        await db.execute(
+            delete(WhisperTranscriptionChunk).where(
+                WhisperTranscriptionChunk.video_id == video.id
+            )
+        )
+        existing = []
+
+    if not existing:
+        existing = [
+            WhisperTranscriptionChunk(
+                video_id=video.id,
+                course_id=video.course_id,
+                user_id=video.user_id,
+                chunk_index=index,
+                offset_seconds=chunk.offset_seconds,
+                duration_seconds=max(1, math.ceil(chunk.duration_seconds)),
+                billable_seconds=max(10, math.ceil(chunk.duration_seconds)),
+                audio_fingerprint=chunk.fingerprint,
+                state="pending",
+                segments_json=[],
+            )
+            for index, chunk in enumerate(chunks)
+        ]
+        db.add_all(existing)
+        await db.commit()
+        return existing
+
+    changed = False
+    for row, chunk in zip(existing, chunks, strict=True):
+        if row.audio_fingerprint != chunk.fingerprint:
+            row.offset_seconds = chunk.offset_seconds
+            row.duration_seconds = max(1, math.ceil(chunk.duration_seconds))
+            row.billable_seconds = max(10, math.ceil(chunk.duration_seconds))
+            row.audio_fingerprint = chunk.fingerprint
+            row.state = "pending"
+            row.segments_json = []
+            row.request_id = None
+            row.retry_at = None
+            row.error_message = None
+            changed = True
+    if changed:
+        await db.commit()
+    return existing
+
+
+async def transcribe_with_whisper(
+    video: Video,
+    db: AsyncSession,
+) -> NormalisedTranscript:
     await _ensure_whisper_quota(video)
 
     with tempfile.TemporaryDirectory(prefix="courseflow-whisper-") as temp_dir:
@@ -335,10 +488,77 @@ async def transcribe_with_whisper(video: Video) -> NormalisedTranscript:
         try:
             audio_path = await asyncio.to_thread(_download_audio, video, temp_path)
             chunks = await asyncio.to_thread(_split_audio_if_needed, audio_path, temp_path)
-            client = AsyncGroq(api_key=settings.groq_api_key)
-            chunk_segments = []
-            for chunk in chunks:
-                chunk_segments.append(await _transcribe_chunk(client, chunk))
+            client = AsyncGroq(api_key=settings.groq_api_key, max_retries=0)
+            quota = QuotaManager()
+            rows = await _prepare_whisper_rows(db, video, chunks)
+            chunk_segments: list[list[TranscriptSegment]] = []
+            try:
+                for chunk, row in zip(chunks, rows, strict=True):
+                    if row.state == "completed" and row.segments_json:
+                        chunk_segments.append(
+                            [
+                                TranscriptSegment.model_validate(segment)
+                                for segment in row.segments_json
+                            ]
+                        )
+                        continue
+
+                    reservation = await quota.reserve_whisper(db, row.billable_seconds)
+                    row.state = "processing"
+                    row.retry_at = None
+                    row.error_message = None
+                    await db.commit()
+                    try:
+                        segments, headers, request_id = await _transcribe_chunk(client, chunk)
+                    except Exception as exc:
+                        await quota.release(reservation)
+                        if getattr(exc, "status_code", None) == 429:
+                            wait_error = await quota.wait_from_headers(
+                                settings.groq_whisper_model,
+                                _error_headers(exc),
+                                _error_body(exc),
+                            )
+                            row.state = "rate_limited"
+                            row.retry_at = datetime.now(UTC) + timedelta(
+                                seconds=wait_error.retry_after
+                            )
+                            row.error_message = str(wait_error)
+                            await db.commit()
+                            raise wait_error from exc
+                        row.state = "pending"
+                        row.error_message = str(exc)
+                        await db.commit()
+                        raise
+
+                    await quota.reconcile(
+                        reservation,
+                        headers=headers,
+                        audio_seconds=row.billable_seconds,
+                    )
+                    row.state = "completed"
+                    row.segments_json = [segment.model_dump() for segment in segments]
+                    row.request_id = request_id
+                    row.error_message = None
+                    db.add(
+                        GroqUsageEvent(
+                            model=settings.groq_whisper_model,
+                            user_id=video.user_id,
+                            video_id=video.id,
+                            course_id=video.course_id,
+                            mode="whisper",
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            cached_tokens=0,
+                            charged_tokens=0,
+                            audio_seconds=row.billable_seconds,
+                            request_id=request_id or f"whisper-{row.id}",
+                        )
+                    )
+                    await db.commit()
+                    chunk_segments.append(segments)
+            finally:
+                await quota.close()
+                await client.close()
 
             segments = _stitch_segments(chunk_segments)
             if not segments:
@@ -355,7 +575,6 @@ async def transcribe_with_whisper(video: Video) -> NormalisedTranscript:
                 word_count=len(full_text.split()),
                 fetched_at=datetime.now(UTC).isoformat(),
             )
-            await _record_whisper_usage(video, len(chunks))
             return transcript
         finally:
             for path in temp_path.glob("*"):
@@ -366,17 +585,20 @@ async def transcribe_with_whisper(video: Video) -> NormalisedTranscript:
 async def extract_transcript(video: Video, db: AsyncSession) -> NormalisedTranscript:
     try:
         transcript = await asyncio.to_thread(fetch_youtube_captions, video.youtube_video_id)
-    except TranscriptValidationError as exc:
+    except Exception as exc:
         logger.warning(
-            "transcript.youtube.invalid",
+            "transcript.youtube.failed",
             video_id=video.youtube_video_id,
+            error_type=type(exc).__name__,
             error=str(exc),
         )
         transcript = None
 
     if transcript is None:
         try:
-            transcript = await transcribe_with_whisper(video)
+            transcript = await transcribe_with_whisper(video, db)
+        except GroqQuotaWaitError:
+            raise
         except QuotaExhaustedError:
             raise
         except (TemporaryAPIError, PermanentAPIError):

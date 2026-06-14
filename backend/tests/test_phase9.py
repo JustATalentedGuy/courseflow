@@ -12,6 +12,7 @@ from app.core.security import hash_password
 from app.models.course import Course
 from app.models.notes import Notes
 from app.models.srs import ConceptCard
+from app.models.transcript import Transcript
 from app.models.user import User
 from app.models.video import Video
 from app.schemas.transcript import NormalisedTranscript, TranscriptSegment
@@ -63,6 +64,40 @@ async def test_manual_prompt_for_single_chunk_video(db_session, redis_client):
     assert NOTES_SYSTEM_PROMPT[:50] in response.prompt_text
     assert response.estimated_tokens > 0
     assert response.video_title == video.title
+
+
+@pytest.mark.asyncio
+async def test_manual_prompt_extracts_missing_transcript(
+    db_session,
+    redis_client,
+    monkeypatch,
+):
+    user = User(
+        email="manual-missing-transcript@example.com",
+        hashed_password=hash_password("password123"),
+    )
+    db_session.add(user)
+    await db_session.flush()
+    course, video = await create_course_video(db_session, user)
+    extracted = short_transcript(video.youtube_video_id)
+
+    async def fake_extract(video_obj, db):
+        return extracted
+
+    monkeypatch.setattr("app.services.manual_assist.extract_transcript", fake_extract)
+
+    response = await generate_manual_prompt(
+        video.id,
+        0,
+        user.id,
+        db_session,
+        redis_client,
+    )
+
+    assert response.total_chunks == 1
+    assert await db_session.scalar(
+        select(Transcript).where(Transcript.video_id == video.id)
+    ) is not None
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { describe, expect, test, vi } from "vitest";
+import { Route, Routes } from "react-router-dom";
 
 import { request } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
@@ -11,6 +12,7 @@ import { MarkdownViewer } from "../components/MarkdownViewer";
 import { QuizFocus } from "../components/QuizFocus";
 import { App } from "../pages/App";
 import { NewCoursePage } from "../pages/CoursePages";
+import { VideoDetailPage } from "../pages/VideoDetailPage";
 import { renderWithProviders } from "./render";
 import { server } from "./server";
 
@@ -121,6 +123,71 @@ describe("Phase 8 frontend", () => {
     expect(statusCalls).toBe(2);
   });
 
+  test("course notes export remains disabled until processing reaches 100 percent", async () => {
+    server.use(
+      http.get(`${API}/courses/course-1`, () => HttpResponse.json(course)),
+      http.get(`${API}/courses/course-1/status`, () => HttpResponse.json({
+        course_id: "course-1",
+        total: 1,
+        pending: 0,
+        processing: 1,
+        rate_limited: 0,
+        batch_processing: 0,
+        completed: 0,
+        failed: 0,
+        deferred: 0,
+        deferred_until: null,
+        next_retry_at: null,
+        quota_remaining: {},
+      })),
+    );
+
+    renderWithProviders(<CourseProgress courseId="course-1" />);
+
+    expect(await screen.findByRole("button", { name: "Export Notes" })).toBeDisabled();
+  });
+
+  test("completed course opens notes format dialog and downloads markdown", async () => {
+    let exportCalls = 0;
+    server.use(
+      http.get(`${API}/courses/course-1`, () => HttpResponse.json({
+        ...course,
+        status: "completed",
+        videos: [{ ...course.videos[0], status: "completed" }],
+      })),
+      http.get(`${API}/courses/course-1/status`, () => HttpResponse.json({
+        course_id: "course-1",
+        total: 1,
+        pending: 0,
+        processing: 0,
+        rate_limited: 0,
+        batch_processing: 0,
+        completed: 1,
+        failed: 0,
+        deferred: 0,
+        deferred_until: null,
+        next_retry_at: null,
+        quota_remaining: {},
+      })),
+      http.get(`${API}/courses/course-1/export/notes/markdown`, () => {
+        exportCalls += 1;
+        return new HttpResponse("# Algorithms", {
+          headers: { "Content-Type": "text/markdown" },
+        });
+      }),
+    );
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:test");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+    renderWithProviders(<CourseProgress courseId="course-1" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Export Notes" }));
+    expect(screen.getByRole("dialog", { name: "Export course notes" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Markdown" }));
+    await waitFor(() => expect(exportCalls).toBe(1));
+  });
+
   test("notes viewer renders markdown headings correctly", () => {
     renderWithProviders(<MarkdownViewer markdown={"## Introduction\nSome text"} />);
     expect(screen.getByRole("heading", { name: "Introduction" })).toBeInTheDocument();
@@ -193,7 +260,7 @@ describe("Phase 8 frontend", () => {
       })),
     );
     renderWithProviders(<CourseProgress courseId="course-1" />);
-    expect(await screen.findByText("Scheduled for Jun 10")).toBeInTheDocument();
+    expect(await screen.findByText(/Daily allowance reached\. Resumes Jun 10/)).toBeInTheDocument();
   });
 
   test("manual assist advances to the next missing chunk", async () => {
@@ -225,5 +292,93 @@ describe("Phase 8 frontend", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save chunk" }));
 
     expect(await screen.findByText("Chunk 2 of 2")).toBeInTheDocument();
+  });
+
+  test("high-quality regeneration explicitly requests the 70B profile", async () => {
+    let requestedQuality = "";
+    server.use(
+      http.get(`${API}/videos/video-1`, () => HttpResponse.json({
+        ...course.videos[0],
+        status: "completed",
+      })),
+      http.get(`${API}/videos/video-1/notes`, () => HttpResponse.json({
+        video_id: "video-1",
+        course_id: "course-1",
+        title: "Binary Search",
+        source_model: "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+        sections: [{ heading: "Binary Search", level: 2, content: "Notes.", concepts: ["search"] }],
+        summary: "Binary search finds values efficiently.",
+        full_markdown: "## Binary Search\n\nNotes.",
+        has_images: false,
+        image_count: 0,
+        generated_at: "2026-06-12T00:00:00Z",
+        token_count: 20,
+        prompt_token_count: 15,
+        completion_token_count: 5,
+        cached_token_count: 0,
+        request_count: 1,
+      })),
+      http.post(`${API}/videos/video-1/notes/regenerate`, async ({ request: incoming }) => {
+        requestedQuality = ((await incoming.json()) as { quality: string }).quality;
+        return HttpResponse.json({
+          video_id: "video-1",
+          course_id: "course-1",
+          title: "Binary Search",
+          source_model: "groq/llama-3.3-70b-versatile",
+          sections: [{ heading: "Binary Search", level: 2, content: "Better notes.", concepts: ["search"] }],
+          summary: "Binary search finds values efficiently.",
+          full_markdown: "## Binary Search\n\nBetter notes.",
+          has_images: false,
+          image_count: 0,
+          generated_at: "2026-06-12T00:00:00Z",
+          token_count: 24,
+          prompt_token_count: 16,
+          completion_token_count: 8,
+          cached_token_count: 0,
+          request_count: 1,
+        });
+      }),
+    );
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/videos/:id" element={<VideoDetailPage />} />
+      </Routes>,
+      { initialEntries: ["/videos/video-1"] },
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "High quality (70B)" }));
+    await waitFor(() => expect(requestedQuality).toBe("high"));
+    expect(await screen.findByText("Generated with llama-3.3-70b-versatile")).toBeInTheDocument();
+  });
+
+  test("failed video displays its reason and can be retried", async () => {
+    let retryCalls = 0;
+    server.use(
+      http.get(`${API}/videos/video-1`, () => HttpResponse.json({
+        ...course.videos[0],
+        status: "failed",
+        error_message: "Generated notes did not pass validation.",
+      })),
+      http.post(`${API}/videos/video-1/retry`, () => {
+        retryCalls += 1;
+        return HttpResponse.json({
+          ...course.videos[0],
+          status: "pending",
+          error_message: null,
+        });
+      }),
+    );
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/videos/:id" element={<VideoDetailPage />} />
+      </Routes>,
+      { initialEntries: ["/videos/video-1"] },
+    );
+
+    expect(await screen.findByText("Generated notes did not pass validation.")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry processing" }));
+    await waitFor(() => expect(retryCalls).toBe(1));
   });
 });

@@ -30,6 +30,7 @@ async def call_external_async(
     service: str,
     max_attempts: int = 3,
     base_delay_seconds: float = 1.0,
+    passthrough_status_codes: set[int] | None = None,
 ) -> T:
     for attempt in range(max_attempts):
         try:
@@ -37,6 +38,8 @@ async def call_external_async(
         except (TemporaryAPIError, PermanentAPIError):
             raise
         except Exception as exc:
+            if getattr(exc, "status_code", None) in (passthrough_status_codes or set()):
+                raise
             classified = classify_external_error(exc, service)
             if isinstance(classified, PermanentAPIError) or attempt == max_attempts - 1:
                 raise classified from exc

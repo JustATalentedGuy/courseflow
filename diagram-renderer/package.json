@@ -1,0 +1,14 @@
+{
+  "name": "courseflow-diagram-renderer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "11.15.0",
+    "express": "4.22.2",
+    "sharp": "0.33.5"
+  }
+}

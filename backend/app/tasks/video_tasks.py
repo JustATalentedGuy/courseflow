@@ -1,20 +1,23 @@
 import asyncio
 import threading
 import time
+import hashlib
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import PermanentAPIError, TemporaryAPIError
+from app.core.config import settings
+from app.core.exceptions import GroqQuotaWaitError, PermanentAPIError, TemporaryAPIError
 from app.db.session import AsyncSessionLocal
 from app.models.course import Course
+from app.models.groq import GroqBatchJob, NoteGenerationChunk
 from app.models.video import Video
 from app.services.embedder import embed_and_store_notes
+from app.services.groq_batch import TERMINAL_BATCH_STATES, poll_batch, submit_video_batch
 from app.services.notes_service import generate_notes_for_video, get_notes_for_video
-from app.services.quota import QuotaManager
 from app.services.transcript import extract_transcript, store_transcript
 from app.workers.celery_app import celery_app
 
@@ -48,12 +51,6 @@ def _run(coro):
     return result.get("value")
 
 
-def _estimate_tokens(video: Video) -> int:
-    if video.duration_seconds:
-        return max(300, min(video.duration_seconds * 8, 6000))
-    return 1000
-
-
 async def _set_video_failed(video_id: str, user_id: str, error: str) -> None:
     async with AsyncSessionLocal() as db:
         video = await db.scalar(
@@ -84,34 +81,20 @@ async def _process_video(video_id: str, user_id: str, task_id: str) -> str:
         video.status = "processing"
         video.celery_task_id = task_id
         video.error_message = None
+        video.scheduled_for = None
         await db.commit()
 
-        quota = QuotaManager()
-        try:
-            estimated_tokens = _estimate_tokens(video)
-            if not await quota.can_process_video(user_id, estimated_tokens):
-                scheduled_for = get_next_midnight_utc()
-                video.status = "deferred"
-                video.scheduled_for = scheduled_for
-                await db.commit()
-                logger.warning(
-                    "video.processing.deferred",
-                    task_id=task_id,
-                    video_id=video_id,
-                    user_id=user_id,
-                    scheduled_for=scheduled_for.isoformat(),
-                )
-                if not celery_app.conf.task_always_eager:
-                    process_video_task.apply_async(args=[video_id, user_id], eta=scheduled_for)
-                return "deferred"
-        finally:
-            await quota.close()
-
-        transcript = await extract_transcript(video, db)
-        await store_transcript(transcript, video, db)
+        if video.transcript is None:
+            transcript = await extract_transcript(video, db)
+            await store_transcript(transcript, video, db)
 
     async with AsyncSessionLocal() as db:
-        notes = await generate_notes_for_video(db, UUID(user_id), UUID(video_id))
+        await generate_notes_for_video(
+            db,
+            UUID(user_id),
+            UUID(video_id),
+            quality="standard",
+        )
 
     async with AsyncSessionLocal() as db:
         video = await db.scalar(
@@ -121,14 +104,56 @@ async def _process_video(video_id: str, user_id: str, task_id: str) -> str:
             raise PermanentAPIError("Video disappeared during processing")
         await _store_note_chunks(video, user_id)
 
-    quota = QuotaManager()
-    try:
-        await quota.increment(user_id, "llm_requests", 1)
-        await quota.increment(user_id, "llm_tokens", notes.token_count)
-    finally:
-        await quota.close()
-
     return "completed"
+
+
+async def _schedule_quota_retry(
+    video_id: str,
+    user_id: str,
+    exc: GroqQuotaWaitError,
+) -> tuple[str, datetime | None]:
+    now = datetime.now(UTC)
+    daily = exc.window == "daily"
+    if daily and settings.groq_batch_enabled:
+        async with AsyncSessionLocal() as db:
+            job = await submit_video_batch(db, UUID(video_id), UUID(user_id))
+        if not celery_app.conf.task_always_eager:
+            poll_groq_batch_task.apply_async(args=[str(job.id)], countdown=300)
+        return "batch_processing", None
+
+    scheduled_for = (
+        get_next_midnight_utc()
+        if daily
+        else now
+        + timedelta(
+            seconds=max(1, exc.retry_after)
+            + (int(hashlib.sha256(video_id.encode()).hexdigest()[:2], 16) % 3)
+        )
+    )
+    status = "deferred" if daily else "rate_limited"
+    async with AsyncSessionLocal() as db:
+        video = await db.scalar(
+            select(Video).where(Video.id == UUID(video_id), Video.user_id == UUID(user_id))
+        )
+        if video is not None:
+            video.status = status
+            video.scheduled_for = scheduled_for
+            video.error_message = str(exc)
+            await db.commit()
+
+    logger.warning(
+        "video.processing.quota_wait",
+        video_id=video_id,
+        user_id=user_id,
+        model=exc.model,
+        window=exc.window,
+        status=status,
+        scheduled_for=scheduled_for.isoformat(),
+        batch_enabled=settings.groq_batch_enabled,
+    )
+    if not celery_app.conf.task_always_eager:
+        process_video_task.apply_async(args=[video_id, user_id], eta=scheduled_for)
+    return status, scheduled_for
 
 
 @celery_app.task(
@@ -156,6 +181,18 @@ def process_video_task(self, video_id: str, user_id: str):
             outcome=outcome,
         )
         return outcome
+    except GroqQuotaWaitError as exc:
+        status, scheduled_for = _run(_schedule_quota_retry(video_id, user_id, exc))
+        logger.info(
+            "video.processing.finished",
+            task_id=task_id,
+            video_id=video_id,
+            user_id=user_id,
+            duration_s=round(time.perf_counter() - started, 3),
+            outcome=status,
+            scheduled_for=scheduled_for.isoformat() if scheduled_for else None,
+        )
+        return status
     except TemporaryAPIError as exc:
         if self.request.retries >= self.max_retries:
             _run(_set_video_failed(video_id, user_id, str(exc)))
@@ -215,9 +252,29 @@ async def _dispatch_course_tasks(course_id: str, user_id: str) -> int:
         )
         if course is None:
             raise PermanentAPIError("Course not found")
-        for video in course.videos:
-            process_video_task.apply_async(args=[str(video.id), user_id])
-        return len(course.videos)
+        requested_count = len(course.videos)
+        queue = list(
+            await db.scalars(
+                select(Video)
+                .join(Course, Course.id == Video.course_id)
+                .where(
+                    Video.status == "pending",
+                    Video.celery_task_id.is_(None),
+                )
+                .order_by(Course.created_at, Video.position)
+            )
+        )
+        assignments = [(video, str(uuid4())) for video in queue]
+        for video, task_id in assignments:
+            video.celery_task_id = task_id
+        await db.commit()
+
+        for video, task_id in assignments:
+            process_video_task.apply_async(
+                args=[str(video.id), str(video.user_id)],
+                task_id=task_id,
+            )
+        return requested_count
 
 
 @celery_app.task(name="app.tasks.video_tasks.dispatch_course_tasks")
@@ -246,3 +303,68 @@ def dispatch_course_tasks(course_id: str, user_id: str):
             outcome="failed",
         )
         raise
+
+
+async def _poll_groq_batch(job_id: str) -> str:
+    async with AsyncSessionLocal() as db:
+        status = await poll_batch(db, UUID(job_id))
+        job = await db.get(GroqBatchJob, UUID(job_id))
+        if job is None:
+            raise PermanentAPIError("Groq Batch job disappeared")
+        video_id = UUID(job.metadata_json["video_id"])
+        user_id = UUID(job.metadata_json["user_id"])
+        if status not in TERMINAL_BATCH_STATES:
+            return status
+
+        incomplete = await db.scalar(
+            select(NoteGenerationChunk.id).where(
+                NoteGenerationChunk.groq_batch_job_id == job.id,
+                NoteGenerationChunk.state != "completed",
+            )
+        )
+        if status == "completed" and incomplete is None:
+            await generate_notes_for_video(
+                db,
+                user_id,
+                video_id,
+                quality="standard",
+            )
+        else:
+            rows = list(
+                await db.scalars(
+                    select(NoteGenerationChunk).where(
+                        NoteGenerationChunk.groq_batch_job_id == job.id,
+                        NoteGenerationChunk.state != "completed",
+                    )
+                )
+            )
+            for row in rows:
+                row.state = "pending"
+                row.groq_batch_job_id = None
+            video = await db.get(Video, video_id)
+            if video is not None:
+                video.status = "deferred"
+                video.scheduled_for = get_next_midnight_utc()
+            await db.commit()
+            if not celery_app.conf.task_always_eager:
+                process_video_task.apply_async(
+                    args=[str(video_id), str(user_id)],
+                    eta=get_next_midnight_utc(),
+                )
+            return "deferred"
+
+    async with AsyncSessionLocal() as db:
+        video = await db.scalar(
+            select(Video).where(Video.id == video_id, Video.user_id == user_id)
+        )
+        if video is not None:
+            await _store_note_chunks(video, str(user_id))
+    return "completed"
+
+
+@celery_app.task(name="app.tasks.video_tasks.poll_groq_batch_task")
+def poll_groq_batch_task(job_id: str):
+    status = _run(_poll_groq_batch(job_id))
+    if status not in TERMINAL_BATCH_STATES and status != "deferred":
+        poll_groq_batch_task.apply_async(args=[job_id], countdown=300)
+    return status

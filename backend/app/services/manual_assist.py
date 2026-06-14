@@ -6,7 +6,7 @@ from uuid import UUID
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ManualChunkIndexError, NotesValidationError, ValidationError
+from app.core.exceptions import ManualChunkIndexError, NotesValidationError
 from app.schemas.manual_assist import ManualNotesResult, ManualPrompt
 from app.schemas.notes import VideoNotes
 from app.services.chunker import chunk_transcript_for_notes
@@ -17,7 +17,11 @@ from app.services.notes_service import (
     parse_notes_sections,
     validate_and_store_notes,
 )
-from app.services.transcript import transcript_record_to_schema
+from app.services.transcript import (
+    extract_transcript,
+    store_transcript,
+    transcript_record_to_schema,
+)
 
 MANUAL_CHUNKS_TTL_SECONDS = 24 * 60 * 60
 
@@ -53,8 +57,10 @@ async def _load_video_chunks(
 ):
     video = await get_video_for_user(db, user_id, video_id)
     if video.transcript is None:
-        raise ValidationError("Video transcript is required for manual-assist mode")
-    transcript = transcript_record_to_schema(video.transcript, video.youtube_video_id)
+        transcript = await extract_transcript(video, db)
+        await store_transcript(transcript, video, db)
+    else:
+        transcript = transcript_record_to_schema(video.transcript, video.youtube_video_id)
     return video, chunk_transcript_for_notes(transcript)
 
 

@@ -1,7 +1,9 @@
 export * from "./auth";
 export * from "./chunk";
 export * from "./course";
+export * from "./diagram";
 export * from "./notes";
+export * from "./quota";
 export * from "./transcript";
 export * from "./video";
 

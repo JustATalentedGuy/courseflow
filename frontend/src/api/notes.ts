@@ -10,10 +10,15 @@ export function getVideoNotesRaw(videoId: string, accessToken: string): Promise<
   return request<string>(`/videos/${videoId}/notes/raw`, { accessToken });
 }
 
-export function regenerateVideoNotes(videoId: string, accessToken: string): Promise<VideoNotes> {
+export function regenerateVideoNotes(
+  videoId: string,
+  accessToken: string,
+  quality?: "standard" | "high",
+): Promise<VideoNotes> {
   return request<VideoNotes>(`/videos/${videoId}/notes/regenerate`, {
     method: "POST",
     accessToken,
+    body: quality ? JSON.stringify({ quality }) : undefined,
   });
 }
 

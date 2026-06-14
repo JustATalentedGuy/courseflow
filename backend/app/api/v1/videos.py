@@ -1,4 +1,4 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import re
 
@@ -10,11 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.deps import get_current_user, get_db, get_redis
-from app.core.exceptions import UserIsolationError
+from app.core.exceptions import (
+    GroqQuotaWaitError,
+    QuotaExhaustedError,
+    UserIsolationError,
+    ValidationError,
+)
 from app.models.user import User
 from app.models.video import Video
 from app.schemas.manual_assist import ManualNotesRequest, ManualNotesResult, ManualPrompt
-from app.schemas.notes import VideoNotes
+from app.schemas.notes import NotesRegenerateRequest, VideoNotes
 from app.schemas.transcript import NormalisedTranscript
 from app.schemas.video import VideoResponse
 from app.services.notes_service import (
@@ -25,6 +30,7 @@ from app.services.notes_service import (
 from app.services.export import export_notes_markdown, export_notes_pdf
 from app.services.manual_assist import generate_manual_prompt, submit_manual_notes
 from app.services.transcript import transcript_record_to_schema
+from app.tasks.video_tasks import process_video_task
 
 router = APIRouter(prefix="/videos", tags=["videos"])
 
@@ -82,10 +88,45 @@ async def get_video_notes_raw(
 @router.post("/{video_id}/notes/regenerate", response_model=VideoNotes)
 async def regenerate_video_notes(
     video_id: UUID,
+    payload: NotesRegenerateRequest | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> VideoNotes:
-    return await generate_notes_for_video(db, current_user.id, video_id)
+    quality = payload.quality if payload is not None else "high"
+    try:
+        return await generate_notes_for_video(
+            db,
+            current_user.id,
+            video_id,
+            quality=quality,
+            reset=True,
+        )
+    except GroqQuotaWaitError as exc:
+        raise QuotaExhaustedError(str(exc), retry_after=exc.retry_after) from exc
+
+
+@router.post("/{video_id}/retry", response_model=VideoResponse)
+async def retry_failed_video(
+    video_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VideoResponse:
+    video = await get_video_for_user(db, current_user.id, video_id)
+    if video.status != "failed":
+        raise ValidationError("Only failed videos can be retried")
+
+    task_id = str(uuid4())
+    video.status = "pending"
+    video.error_message = None
+    video.scheduled_for = None
+    video.celery_task_id = task_id
+    await db.commit()
+    process_video_task.apply_async(
+        args=[str(video.id), str(current_user.id)],
+        task_id=task_id,
+    )
+    await db.refresh(video)
+    return VideoResponse.model_validate(video)
 
 
 @router.get("/{video_id}/manual-prompt", response_model=ManualPrompt)

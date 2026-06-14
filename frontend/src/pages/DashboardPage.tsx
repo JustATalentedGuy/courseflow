@@ -5,6 +5,7 @@ import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YA
 
 import { getCourse, listCourses } from "../api/courses";
 import { getQuizHistory } from "../api/quiz";
+import { getQuotaUsage } from "../api/quota";
 import { getSrsStats } from "../api/srs";
 import { StatusChip } from "../components/StatusChip";
 
@@ -23,7 +24,11 @@ async function loadDashboardActivity() {
 export function DashboardPage() {
   const stats = useQuery({ queryKey: ["srs-stats"], queryFn: getSrsStats });
   const activity = useQuery({ queryKey: ["dashboard-activity"], queryFn: loadDashboardActivity });
-  const quotaRemaining = 1000;
+  const quota = useQuery({ queryKey: ["groq-quota"], queryFn: getQuotaUsage, refetchInterval: 30_000 });
+  const scout = quota.data?.models.find((model) => model.model.includes("llama-4-scout"));
+  const usedTokens = scout?.tokens_day.used ?? 0;
+  const tokenLimit = scout?.tokens_day.limit ?? 475_000;
+  const utilization = scout?.tokens_day.utilization_percent ?? 0;
 
   return (
     <div>
@@ -54,10 +59,14 @@ export function DashboardPage() {
         </section>
         <section className="rounded-3xl bg-slate-950 p-6 text-white shadow-sm">
           <p className="text-sm font-semibold text-blue-300">Daily Groq quota</p>
-          <p className="mt-3 text-3xl font-bold">{quotaRemaining} / 1000</p>
-          <p className="mt-1 text-sm text-slate-400">LLM requests remaining today</p>
-          <div className="mt-6 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full w-full rounded-full bg-blue-400" /></div>
-          <p className="mt-4 text-xs text-slate-400">Exact live quota appears after opening a course status page.</p>
+          <p className="mt-3 text-3xl font-bold">{usedTokens.toLocaleString()} / {tokenLimit.toLocaleString()}</p>
+          <p className="mt-1 text-sm text-slate-400">Scout charged tokens used today</p>
+          <div className="mt-6 h-2 overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-blue-400" style={{ width: `${Math.min(utilization, 100)}%` }} />
+          </div>
+          <p className="mt-4 text-xs text-slate-400">
+            {scout ? `${scout.requests_day.remaining} requests and ${scout.tokens_day.remaining.toLocaleString()} tokens remain.` : "Loading live model allowance..."}
+          </p>
           <Link to="/review" className="mt-8 flex items-center justify-between rounded-2xl bg-white px-4 py-4 font-semibold text-slate-950">
             Start today's review <ArrowRight className="h-4 w-4" />
           </Link>

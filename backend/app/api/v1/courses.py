@@ -21,8 +21,13 @@ from app.services.course_service import (
     list_courses,
 )
 from app.services.ingestion import ingest_playlist
-from app.services.export import export_anki_deck
+from app.services.export import (
+    export_anki_deck,
+    export_course_notes_markdown,
+    export_course_notes_pdf,
+)
 from app.services.notes_service import get_notes_for_course
+from app.tasks.video_tasks import dispatch_course_tasks
 
 router = APIRouter(prefix="/courses", tags=["courses"])
 
@@ -34,6 +39,7 @@ async def create(
     db: AsyncSession = Depends(get_db),
 ) -> CourseResponse:
     course = await ingest_playlist(payload.playlist_url, current_user.id, db)
+    dispatch_course_tasks.delay(str(course.id), str(current_user.id))
     return CourseResponse.model_validate(course)
 
 
@@ -98,4 +104,47 @@ async def download_course_anki(
         content=content,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{filename}.apkg"'},
+    )
+
+
+def _course_export_filename(title: str, extension: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-") or "courseflow"
+    return f"{slug}-notes.{extension}"
+
+
+@router.get("/{course_id}/export/notes/markdown")
+async def download_course_notes_markdown(
+    course_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    course = await get_course(db, current_user.id, course_id)
+    content = await export_course_notes_markdown(course_id, current_user.id, db)
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{_course_export_filename(course.title, "md")}"'
+            )
+        },
+    )
+
+
+@router.get("/{course_id}/export/notes/pdf")
+async def download_course_notes_pdf(
+    course_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    course = await get_course(db, current_user.id, course_id)
+    content = await export_course_notes_pdf(course_id, current_user.id, db)
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{_course_export_filename(course.title, "pdf")}"'
+            )
+        },
     )

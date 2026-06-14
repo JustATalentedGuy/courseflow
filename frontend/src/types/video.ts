@@ -1,6 +1,8 @@
 export type VideoStatus =
   | "pending"
   | "deferred"
+  | "rate_limited"
+  | "batch_processing"
   | "processing"
   | "completed"
   | "failed"

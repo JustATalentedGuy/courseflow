@@ -1,3 +1,4 @@
+import json
 import subprocess
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -149,6 +150,28 @@ def test_ytdlp_metadata_timeout_is_bounded(monkeypatch):
 
     with pytest.raises(ValidationError, match="30 seconds"):
         _extract_youtube_info("https://youtu.be/example")
+
+
+def test_ytdlp_metadata_accepts_valid_json_with_nonzero_exit(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.ingestion.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=json.dumps(
+                {
+                    "id": "example",
+                    "title": "Example video",
+                    "duration": 60,
+                }
+            ),
+            stderr="Requested format is not available",
+        ),
+    )
+
+    info = _extract_youtube_info("https://youtu.be/example")
+
+    assert info["id"] == "example"
 
 
 @pytest.mark.asyncio

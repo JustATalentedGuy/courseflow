@@ -1,4 +1,6 @@
 import re
+import inspect
+from dataclasses import dataclass
 
 from groq import AsyncGroq
 
@@ -16,10 +18,27 @@ Rules:
 - Include concrete examples from the transcript
 - Do NOT hallucinate information not present in the transcript
 - Do NOT include filler content, meta-commentary, or references to the speaker
-- If a concept requires a diagram, write: {{DIAGRAM: brief description}} as a placeholder
+- If a concept genuinely benefits from a diagram, write one placeholder in this exact form:
+  {{DIAGRAM: learning goal; entities/components; relationships and arrow directions; essential labels}}
+- Diagram descriptions must be detailed enough for a separate renderer to recreate the visual
+- Prefer diagrams for architecture, data structures, flows, and comparisons; do not request decorative images
 - Output only valid Markdown, no preamble or postamble
 - End each section with a "Key Concepts:" bullet list of 3-5 extractable terms
 """.strip()
+
+MAX_COMPLETION_TOKENS = 1200
+
+
+@dataclass(frozen=True)
+class GroqChunkResult:
+    markdown: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
+    charged_tokens: int
+    request_id: str | None
+    headers: dict[str, str]
 
 
 def _deterministic_notes(chunk: TranscriptChunk, chunk_index: int) -> str:
@@ -44,6 +63,90 @@ def _completion_text(response) -> str:
     return getattr(message, "content", "")
 
 
+def build_notes_messages(
+    chunk: TranscriptChunk,
+    chunk_index: int,
+    total_chunks: int,
+    previous_summary: str | None,
+) -> list[dict[str, str]]:
+    context = ""
+    if chunk_index > 0 and previous_summary:
+        context = f"Previous section covered: {previous_summary}. Continue notes without repeating it.\n\n"
+    user_prompt = (
+        f"{context}"
+        f"This is part {chunk_index + 1} of {total_chunks} of the lecture.\n\n"
+        f"Transcript chunk:\n{chunk.text}"
+    )
+    return [
+        {"role": "system", "content": NOTES_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _usage_value(usage, name: str) -> int:
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        return int(usage.get(name) or 0)
+    return int(getattr(usage, name, 0) or 0)
+
+
+def _cached_tokens(usage) -> int:
+    direct = _usage_value(usage, "cached_tokens")
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else getattr(
+        usage,
+        "prompt_tokens_details",
+        None,
+    )
+    if isinstance(details, dict):
+        return direct or int(details.get("cached_tokens") or 0)
+    return direct or int(getattr(details, "cached_tokens", 0) or 0)
+
+
+async def generate_groq_notes_for_chunk(
+    chunk: TranscriptChunk,
+    chunk_index: int,
+    total_chunks: int,
+    previous_summary: str | None,
+    groq_client: AsyncGroq,
+    model: str,
+) -> GroqChunkResult:
+    messages = build_notes_messages(chunk, chunk_index, total_chunks, previous_summary)
+
+    async def create_completion():
+        return await groq_client.chat.completions.with_raw_response.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
+        )
+
+    raw_response = await call_external_async(
+        create_completion,
+        "Groq notes",
+        passthrough_status_codes={429},
+    )
+    response = raw_response.parse()
+    if inspect.isawaitable(response):
+        response = await response
+    headers = {key.lower(): value for key, value in raw_response.headers.items()}
+    usage = getattr(response, "usage", None)
+    prompt_tokens = _usage_value(usage, "prompt_tokens")
+    completion_tokens = _usage_value(usage, "completion_tokens")
+    cached_tokens = _cached_tokens(usage)
+    total_tokens = prompt_tokens + completion_tokens
+    return GroqChunkResult(
+        markdown=_completion_text(response).strip(),
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
+        charged_tokens=max(total_tokens - cached_tokens, 0),
+        request_id=headers.get("x-request-id") or getattr(response, "id", None),
+        headers=headers,
+    )
+
+
 async def generate_notes_for_chunk(
     chunk: TranscriptChunk,
     chunk_index: int,
@@ -54,23 +157,12 @@ async def generate_notes_for_chunk(
     if groq_client is None:
         return _deterministic_notes(chunk, chunk_index)
 
-    context = ""
-    if chunk_index > 0 and previous_summary:
-        context = f"Previous section covered: {previous_summary}. Continue notes without repeating it.\n\n"
-
-    user_prompt = (
-        f"{context}"
-        f"This is part {chunk_index + 1} of {total_chunks} of the lecture.\n\n"
-        f"Transcript chunk:\n{chunk.text}"
-    )
     async def create_completion():
         return await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": NOTES_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=build_notes_messages(chunk, chunk_index, total_chunks, previous_summary),
             temperature=0.2,
+            max_completion_tokens=MAX_COMPLETION_TOKENS,
         )
 
     response = await call_external_async(create_completion, "Groq notes")
@@ -85,7 +177,17 @@ def _strip_markdown(text: str) -> str:
 
 
 def _summary_from_markdown(markdown: str) -> str:
-    plain = _strip_markdown(markdown)
+    narrative_lines = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith(("#", "-", "*", "+"))
+            or stripped.lower().startswith("key concepts:")
+        ):
+            continue
+        narrative_lines.append(stripped)
+    plain = _strip_markdown(" ".join(narrative_lines) or markdown)
     sentences = re.split(r"(?<=[.!?])\s+", plain)
     selected = [sentence.strip() for sentence in sentences if sentence.strip()][:3]
     if not selected:

@@ -62,6 +62,17 @@ services:
         mc mb --ignore-existing "local/$$MINIO_BUCKET"
     restart: "no"
 
+  diagram-renderer:
+    build:
+      context: ./diagram-renderer
+    environment:
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3010/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   migrate:
     build:
       context: ./backend
@@ -73,9 +84,36 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-courseflow}
       MINIO_SECURE: "false"
+      DIAGRAM_RENDERER_URL: ${DIAGRAM_RENDERER_URL:-http://diagram-renderer:3010}
       SECRET_KEY: ${SECRET_KEY:-development_only_change_me}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_BATCH_ENABLED: ${GROQ_BATCH_ENABLED:-false}
+      GROQ_AUTO_MODEL: ${GROQ_AUTO_MODEL:-meta-llama/llama-4-scout-17b-16e-instruct}
+      GROQ_HIGH_QUALITY_MODEL: ${GROQ_HIGH_QUALITY_MODEL:-llama-3.3-70b-versatile}
+      GROQ_DAILY_RESERVE_PERCENT: ${GROQ_DAILY_RESERVE_PERCENT:-0}
+      GROQ_SCOUT_RPM: ${GROQ_SCOUT_RPM:-30}
+      GROQ_SCOUT_RPD: ${GROQ_SCOUT_RPD:-1000}
+      GROQ_SCOUT_TPM: ${GROQ_SCOUT_TPM:-30000}
+      GROQ_SCOUT_TPD: ${GROQ_SCOUT_TPD:-500000}
+      GROQ_70B_RPM: ${GROQ_70B_RPM:-30}
+      GROQ_70B_RPD: ${GROQ_70B_RPD:-1000}
+      GROQ_70B_TPM: ${GROQ_70B_TPM:-12000}
+      GROQ_70B_TPD: ${GROQ_70B_TPD:-100000}
+      GROQ_WHISPER_MODEL: ${GROQ_WHISPER_MODEL:-whisper-large-v3-turbo}
+      GROQ_WHISPER_RPM: ${GROQ_WHISPER_RPM:-20}
+      GROQ_WHISPER_RPD: ${GROQ_WHISPER_RPD:-2000}
+      GROQ_WHISPER_ASH: ${GROQ_WHISPER_ASH:-7200}
+      GROQ_WHISPER_ASD: ${GROQ_WHISPER_ASD:-28800}
+      YOUTUBE_AUDIO_DOWNLOAD_MIN_TIMEOUT_SECONDS: ${YOUTUBE_AUDIO_DOWNLOAD_MIN_TIMEOUT_SECONDS:-120}
+      YOUTUBE_AUDIO_DOWNLOAD_MAX_TIMEOUT_SECONDS: ${YOUTUBE_AUDIO_DOWNLOAD_MAX_TIMEOUT_SECONDS:-900}
+      YOUTUBE_AUDIO_DOWNLOAD_TIMEOUT_SECONDS_PER_MINUTE: ${YOUTUBE_AUDIO_DOWNLOAD_TIMEOUT_SECONDS_PER_MINUTE:-6}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_IMAGE_MODEL: ${CLOUDFLARE_IMAGE_MODEL:-@cf/black-forest-labs/flux-2-klein-4b}
+      CLOUDFLARE_DAILY_NEURON_BUDGET: ${CLOUDFLARE_DAILY_NEURON_BUDGET:-8000}
+      CLOUDFLARE_IMAGE_ESTIMATED_NEURONS: ${CLOUDFLARE_IMAGE_ESTIMATED_NEURONS:-400}
+      CLOUDFLARE_IMAGE_CONCURRENCY: ${CLOUDFLARE_IMAGE_CONCURRENCY:-1}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:5173"]}'
     depends_on:
@@ -95,6 +133,8 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      diagram-renderer:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
@@ -118,6 +158,23 @@ services:
       minio-init:
         condition: service_completed_successfully
     command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2
+    volumes:
+      - ./backend:/app
+
+  diagram-worker:
+    build:
+      context: ./backend
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      diagram-renderer:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=1 -Q diagrams
     volumes:
       - ./backend:/app
 

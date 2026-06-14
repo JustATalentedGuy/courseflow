@@ -64,6 +64,7 @@ def _extract_youtube_info(url: str) -> dict:
                 "--flat-playlist",
                 "--skip-download",
                 "--ignore-errors",
+                "--ignore-no-formats-error",
                 "--no-warnings",
                 url,
             ],
@@ -74,12 +75,17 @@ def _extract_youtube_info(url: str) -> dict:
         )
     except subprocess.TimeoutExpired as exc:
         raise ValidationError("YouTube metadata request timed out after 30 seconds") from exc
-    if result.returncode != 0 or not result.stdout.strip():
+    if not result.stdout.strip():
         raise ValidationError("Unable to read YouTube URL. It may be private or unavailable.")
     try:
-        return json.loads(result.stdout)
+        info = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ValidationError("YouTube returned invalid metadata") from exc
+    if not isinstance(info, dict) or not info:
+        raise ValidationError("Unable to read YouTube URL. It may be private or unavailable.")
+    if result.returncode != 0:
+        logger.warning("youtube.metadata.partial", url=url)
+    return info
 
 
 def _video_id_from_entry(entry: dict) -> str | None:

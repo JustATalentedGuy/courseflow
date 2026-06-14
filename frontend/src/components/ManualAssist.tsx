@@ -101,7 +101,11 @@ export function ManualAssist({
               {submit.isPending ? "Validating..." : prompt.data.total_chunks > 1 ? "Save chunk" : "Save notes"}
             </button>
           </>
-        ) : <p className="mt-8 text-rose-600">Could not prepare the manual prompt.</p>}
+        ) : (
+          <p className="mt-8 text-rose-600">
+            {prompt.error?.message ?? "Could not prepare the manual prompt."}
+          </p>
+        )}
       </div>
     </div>
   );

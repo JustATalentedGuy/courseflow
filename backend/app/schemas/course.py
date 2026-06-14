@@ -38,8 +38,11 @@ class CourseStatusResponse(BaseModel):
     total: int
     pending: int
     processing: int
+    rate_limited: int
+    batch_processing: int
     completed: int
     failed: int
     deferred: int
     deferred_until: datetime | None = None
+    next_retry_at: datetime | None = None
     quota_remaining: dict[str, int] = Field(default_factory=dict)

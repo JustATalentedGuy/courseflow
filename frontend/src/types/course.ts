@@ -24,12 +24,18 @@ export interface CourseStatusResponse {
   total: number;
   pending: number;
   processing: number;
+  rate_limited: number;
+  batch_processing: number;
   completed: number;
   failed: number;
   deferred: number;
   deferred_until: string | null;
+  next_retry_at: string | null;
   quota_remaining: {
     llm_requests?: number;
+    llm_tokens?: number;
     whisper_requests?: number;
+    whisper_audio_seconds_hour?: number;
+    whisper_audio_seconds_day?: number;
   };
 }

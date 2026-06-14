@@ -11,7 +11,7 @@ celery_app = Celery(
     "courseflow",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.video_tasks", "app.tasks.maintenance"],
+    include=["app.tasks.video_tasks", "app.tasks.diagram_tasks", "app.tasks.maintenance"],
 )
 
 celery_app.conf.update(
@@ -25,11 +25,18 @@ celery_app.conf.update(
     task_track_started=True,
     task_reject_on_worker_lost=True,
     broker_connection_retry_on_startup=True,
+    task_routes={
+        "app.tasks.diagram_tasks.*": {"queue": "diagrams"},
+    },
 )
 
 celery_app.conf.beat_schedule = {
     "cleanup-stale-processing": {
         "task": "app.tasks.maintenance.cleanup_stale_processing_videos",
         "schedule": crontab(minute=0, hour="*/1"),
+    },
+    "cleanup-stale-diagram-objects": {
+        "task": "app.tasks.maintenance.cleanup_stale_diagram_objects",
+        "schedule": crontab(minute=30, hour=3),
     },
 }

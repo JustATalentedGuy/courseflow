@@ -5,13 +5,18 @@ from app.schemas.chunk import TextChunk, TranscriptChunk
 from app.schemas.notes import VideoNotes
 from app.schemas.transcript import NormalisedTranscript
 
-TARGET_NOTES_CHUNK_TOKENS = 1500
+TARGET_NOTES_CHUNK_TOKENS = 3500
 SHORT_TRANSCRIPT_TOKENS = 300
 EMBEDDING_CHUNK_TOKENS = 500
 SENTENCE_OVERLAP = 2
 
 
-def _token_count(text: str) -> int:
+def estimate_model_tokens(text: str) -> int:
+    # A conservative tokenizer-free estimate for Llama-family prompts.
+    return max(1, (len(text) + 3) // 4)
+
+
+def _word_count(text: str) -> int:
     return len(text.split())
 
 
@@ -20,8 +25,14 @@ def _split_sentences(text: str) -> list[str]:
     return [sentence.strip() for sentence in sentences if sentence.strip()]
 
 
-def _split_long_sentence(sentence: str, max_tokens: int = TARGET_NOTES_CHUNK_TOKENS) -> list[str]:
-    if _token_count(sentence) <= max_tokens:
+def _split_long_sentence(
+    sentence: str,
+    max_tokens: int = TARGET_NOTES_CHUNK_TOKENS,
+    *,
+    model_tokens: bool = True,
+) -> list[str]:
+    count_tokens = estimate_model_tokens if model_tokens else _word_count
+    if count_tokens(sentence) <= max_tokens:
         return [sentence]
 
     parts = [part.strip() for part in sentence.split(",") if part.strip()]
@@ -30,7 +41,7 @@ def _split_long_sentence(sentence: str, max_tokens: int = TARGET_NOTES_CHUNK_TOK
     current_tokens = 0
 
     for part in parts:
-        part_tokens = _token_count(part)
+        part_tokens = count_tokens(part)
         if current and current_tokens + part_tokens > max_tokens:
             chunks.append(", ".join(current).strip())
             current = []
@@ -43,13 +54,14 @@ def _split_long_sentence(sentence: str, max_tokens: int = TARGET_NOTES_CHUNK_TOK
 
     bounded_chunks: list[str] = []
     for chunk in chunks:
-        if _token_count(chunk) <= max_tokens:
+        if count_tokens(chunk) <= max_tokens:
             bounded_chunks.append(chunk)
             continue
         words = chunk.split()
+        words_per_chunk = max_tokens if not model_tokens else max(1, max_tokens * 3 // 4)
         bounded_chunks.extend(
-            " ".join(words[index : index + max_tokens])
-            for index in range(0, len(words), max_tokens)
+            " ".join(words[index : index + words_per_chunk])
+            for index in range(0, len(words), words_per_chunk)
         )
     return bounded_chunks
 
@@ -67,7 +79,7 @@ def _sentences_with_times(transcript: NormalisedTranscript) -> list[tuple[str, f
 
 
 def chunk_transcript_for_notes(transcript: NormalisedTranscript) -> list[TranscriptChunk]:
-    if _token_count(transcript.full_text) < SHORT_TRANSCRIPT_TOKENS:
+    if estimate_model_tokens(transcript.full_text) < SHORT_TRANSCRIPT_TOKENS:
         return [
             TranscriptChunk(
                 text=transcript.full_text,
@@ -85,11 +97,11 @@ def chunk_transcript_for_notes(transcript: NormalisedTranscript) -> list[Transcr
     index = 0
     while index < len(timed_sentences):
         sentence, start, end = timed_sentences[index]
-        sentence_tokens = _token_count(sentence)
+        sentence_tokens = estimate_model_tokens(sentence)
         if current and current_tokens + sentence_tokens > TARGET_NOTES_CHUNK_TOKENS:
             chunks.append(_build_transcript_chunk(current, len(chunks)))
             current = current[-SENTENCE_OVERLAP:] if len(current) > SENTENCE_OVERLAP else current[:]
-            current_tokens = sum(_token_count(item[0]) for item in current)
+            current_tokens = sum(estimate_model_tokens(item[0]) for item in current)
             continue
 
         current.append((sentence, start, end))
@@ -116,18 +128,24 @@ def _split_paragraphs_for_embedding(text: str) -> list[str]:
     paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
     bounded_paragraphs: list[str] = []
     for paragraph in paragraphs or [text]:
-        if _token_count(paragraph) <= EMBEDDING_CHUNK_TOKENS:
+        if _word_count(paragraph) <= EMBEDDING_CHUNK_TOKENS:
             bounded_paragraphs.append(paragraph)
             continue
         sentences = _split_sentences(paragraph) or [paragraph]
         for sentence in sentences:
-            bounded_paragraphs.extend(_split_long_sentence(sentence, EMBEDDING_CHUNK_TOKENS))
+            bounded_paragraphs.extend(
+                _split_long_sentence(
+                    sentence,
+                    EMBEDDING_CHUNK_TOKENS,
+                    model_tokens=False,
+                )
+            )
 
     chunks: list[str] = []
     current: list[str] = []
     current_tokens = 0
     for paragraph in bounded_paragraphs:
-        paragraph_tokens = _token_count(paragraph)
+        paragraph_tokens = _word_count(paragraph)
         if current and current_tokens + paragraph_tokens > EMBEDDING_CHUNK_TOKENS:
             chunks.append("\n\n".join(current))
             current = []

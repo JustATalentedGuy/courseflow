@@ -7,7 +7,9 @@ import structlog
 from sqlalchemy import select
 
 from app.db.session import AsyncSessionLocal
+from app.models.diagram import DiagramAsset
 from app.models.video import Video
+from app.services.object_storage import delete_object
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger()
@@ -73,3 +75,33 @@ def cleanup_stale_processing_videos(self):
             outcome="failed",
         )
         raise
+
+
+async def _cleanup_stale_diagram_objects() -> int:
+    threshold = datetime.now(UTC) - timedelta(days=7)
+    async with AsyncSessionLocal() as db:
+        rows = list(
+            await db.scalars(
+                select(DiagramAsset).where(
+                    DiagramAsset.state == "stale",
+                    DiagramAsset.object_uri.is_not(None),
+                    DiagramAsset.created_at < threshold,
+                )
+            )
+        )
+        deleted = 0
+        for row in rows:
+            try:
+                await delete_object(row.object_uri)
+            except Exception:
+                logger.exception("diagram.cleanup.failed", diagram_id=str(row.id))
+                continue
+            row.object_uri = None
+            deleted += 1
+        await db.commit()
+        return deleted
+
+
+@celery_app.task(name="app.tasks.maintenance.cleanup_stale_diagram_objects")
+def cleanup_stale_diagram_objects():
+    return _run(_cleanup_stale_diagram_objects())

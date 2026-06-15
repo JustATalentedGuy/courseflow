@@ -1,13 +1,9 @@
 {
   "mcpServers": {
     "courseflow": {
-      "command": "powershell.exe",
+      "command": "C:\\absolute\\path\\to\\courseflow\\backend\\.venv\\Scripts\\python.exe",
       "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        "C:\\absolute\\path\\to\\courseflow\\deploy\\run-mcp.ps1"
+        "C:\\absolute\\path\\to\\courseflow\\deploy\\run_mcp.py"
       ]
     }
   }

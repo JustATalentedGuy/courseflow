@@ -1070,8 +1070,9 @@ Merge `deploy/claude_desktop_config.example.json` into:
 %APPDATA%\Claude\claude_desktop_config.json
 ```
 
-Replace the example path with the absolute path to `deploy\run-mcp.ps1`, restart
-Claude Desktop, and invoke `list_my_courses`. On startup, the MCP server reports
+Replace the example paths with the absolute paths to the backend virtual
+environment's `python.exe` and `deploy\run_mcp.py`, restart Claude Desktop, and
+invoke `list_my_courses`. On startup, the MCP server reports
 a targeted diagnostic when EC2 is stopped or the current IP is no longer
 allowed by the security group.
 

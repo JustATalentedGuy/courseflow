@@ -5,6 +5,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.chunk import NoteChunk
 from app.models.course import Course
 from app.models.video import Video
 from app.services.search import semantic_search
@@ -71,6 +72,12 @@ async def search_courses_for_mcp(
         )
         if owned is None:
             raise ValueError("course_id does not belong to the configured CourseFlow user")
+
+    available = select(NoteChunk.id).where(NoteChunk.user_id == user_id).limit(1)
+    if course_id is not None:
+        available = available.where(NoteChunk.course_id == UUID(course_id))
+    if await db.scalar(available) is None:
+        return []
 
     results = await semantic_search(
         query=query,

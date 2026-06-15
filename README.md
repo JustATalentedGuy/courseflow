@@ -1019,7 +1019,7 @@ to `~/courseflow`, copy `.env.production.example` to `.env.production`, and set:
 
 ```dotenv
 COURSEFLOW_DOMAIN=<subdomain>.duckdns.org
-CORS_ORIGINS=https://<subdomain>.duckdns.org
+CORS_ORIGINS=["https://<subdomain>.duckdns.org"]
 VITE_API_URL=https://<subdomain>.duckdns.org
 AWS_S3_BUCKET=<bucket-returned-by-provisioning>
 POSTGRES_PASSWORD=<strong-random-password>

@@ -30,6 +30,8 @@ losing the benefits of active recall, organized notes, and long-term review.
 - [API Overview](#api-overview)
 - [Data, Privacy, and Security](#data-privacy-and-security)
 - [Operations and Troubleshooting](#operations-and-troubleshooting)
+- [AWS Production Deployment](#aws-production-deployment)
+- [Claude Desktop MCP Integration](#claude-desktop-mcp-integration)
 - [Current Scope](#current-scope)
 
 ## The Problem
@@ -966,6 +968,112 @@ docker compose up -d --build
 ```
 
 This deletes all local application data.
+
+## AWS Production Deployment
+
+The repository includes the production artifacts described by the deployment
+guide:
+
+- `docker-compose.production.yml` runs PostgreSQL, Redis, migrations, the API,
+  general and diagram workers, Celery Beat, the Mermaid renderer, and a static
+  nginx frontend.
+- `frontend/Dockerfile.production` builds the React bundle once and serves it
+  through nginx instead of Vite's development server.
+- `deploy/Caddyfile.example` routes HTTPS traffic to the API and frontend.
+- `deploy/provision-aws.ps1` creates the tagged EC2, networking, Elastic IP,
+  private S3, IAM role, and optional budget.
+- `deploy/cloudwatch-agent.json` collects Docker logs and host CPU, memory, and
+  disk metrics.
+- `.github/workflows/deploy.yml` performs migration-gated SSH deployments.
+
+### 1. Save Deployment Secrets Locally
+
+```powershell
+Copy-Item .env.deploy.example .env.deploy
+```
+
+Set the DuckDNS subdomain, DuckDNS token, and budget email in `.env.deploy`.
+This file is ignored by Git.
+
+### 2. Provision AWS
+
+```powershell
+.\deploy\provision-aws.ps1 -BillingEmail "you@example.com"
+```
+
+The script uses the `courseflow` AWS CLI profile, `ap-south-1`, the current
+public IP, a `t4g.small` Ubuntu 24.04 ARM instance, 30 GB gp3 storage, and the
+required `project=courseflow` and `env=demo` tags. It stores the new private SSH
+key at `%USERPROFILE%\.ssh\courseflow-key.pem`.
+
+### 3. Point DuckDNS to the Elastic IP
+
+```powershell
+.\deploy\update-duckdns.ps1 -IpAddress "<elastic-ip>"
+```
+
+### 4. Bootstrap and Configure the Server
+
+Copy and run `deploy/bootstrap-ubuntu.sh` on the instance. Clone this repository
+to `~/courseflow`, copy `.env.production.example` to `.env.production`, and set:
+
+```dotenv
+COURSEFLOW_DOMAIN=<subdomain>.duckdns.org
+CORS_ORIGINS=https://<subdomain>.duckdns.org
+VITE_API_URL=https://<subdomain>.duckdns.org
+AWS_S3_BUCKET=<bucket-returned-by-provisioning>
+POSTGRES_PASSWORD=<strong-random-password>
+SECRET_KEY=<openssl-rand-hex-32-output>
+GROQ_API_KEY=<key>
+```
+
+Do not add AWS access keys. Containers obtain S3 credentials from the EC2 IAM
+role.
+
+Copy the configured Caddyfile to `/etc/caddy/Caddyfile`, restart Caddy, then run:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml build
+docker compose --env-file .env.production -f docker-compose.production.yml run --rm migrate
+docker compose --env-file .env.production -f docker-compose.production.yml up -d
+```
+
+Install the CloudWatch agent configuration from
+`deploy/cloudwatch-agent.json`. Verify the application over HTTPS, API health,
+private S3 access, worker queues, and automatic restart behavior.
+
+## Claude Desktop MCP Integration
+
+CourseFlow includes a local read-only stdio MCP server with three tools:
+
+- `list_my_courses`
+- `search_my_courses`
+- `ask_my_courses`
+
+The server runs on the laptop and connects to the deployed PostgreSQL database.
+Every query is scoped to `COURSEFLOW_MCP_USER_ID`. The answer tool retrieves
+course excerpts first and returns timestamped sources.
+
+Create its ignored environment file:
+
+```powershell
+Copy-Item backend\.env.mcp.example backend\.env.mcp
+```
+
+Set the deployed database URL, the UUID of the CourseFlow user to expose, and
+the Groq key. Keep PostgreSQL port `5432` restricted to the current public IP in
+`courseflow-sg`.
+
+Merge `deploy/claude_desktop_config.example.json` into:
+
+```text
+%APPDATA%\Claude\claude_desktop_config.json
+```
+
+Replace the example path with the absolute path to `deploy\run-mcp.ps1`, restart
+Claude Desktop, and invoke `list_my_courses`. On startup, the MCP server reports
+a targeted diagnostic when EC2 is stopped or the current IP is no longer
+allowed by the security group.
 
 ## License
 

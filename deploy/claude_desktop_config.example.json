@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "courseflow": {
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "C:\\absolute\\path\\to\\courseflow\\deploy\\run-mcp.ps1"
+      ]
+    }
+  }
+}

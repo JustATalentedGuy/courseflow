@@ -35,6 +35,7 @@ from app.services.diagram_quota import CloudflareQuotaManager
 from app.services.image_provider import CloudflareImageProvider
 from app.services.mermaid_renderer import render_mermaid, validate_mermaid
 from app.services.object_storage import (
+    build_object_uri,
     delete_object,
     generate_presigned_url,
     read_object,
@@ -691,9 +692,8 @@ async def process_diagram(db: AsyncSession, diagram_id: UUID) -> str:
 
     previous_object_uri = asset.object_uri
     revision = asset.revision + 1
-    object_uri = (
-        f"minio://{asset.user_id}/{asset.video_id}/diagrams/"
-        f"{asset.id}/{revision}.{extension}"
+    object_uri = build_object_uri(
+        f"{asset.user_id}/{asset.video_id}/diagrams/{asset.id}/{revision}.{extension}"
     )
     await upload_object(object_uri, image.content, image.content_type)
     asset.object_uri = object_uri

@@ -84,6 +84,9 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-courseflow}
       MINIO_SECURE: "false"
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-minio}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
       DIAGRAM_RENDERER_URL: ${DIAGRAM_RENDERER_URL:-http://diagram-renderer:3010}
       SECRET_KEY: ${SECRET_KEY:-development_only_change_me}
       GROQ_API_KEY: ${GROQ_API_KEY:-}

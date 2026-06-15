@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "courseflow"
     minio_secure: bool = False
+    storage_backend: str = "minio"
+    aws_s3_bucket: str = ""
+    aws_region: str = "ap-south-1"
     diagram_renderer_url: str = "http://diagram-renderer:3010"
 
     secret_key: str = "changeme_in_production_use_openssl_rand_hex_32"
@@ -48,6 +51,7 @@ class Settings(BaseSettings):
     cloudflare_daily_neuron_budget: int = 8_000
     cloudflare_image_estimated_neurons: int = 400
     cloudflare_image_concurrency: int = 1
+    courseflow_mcp_user_id: str = ""
 
     environment: str = "development"
     log_level: str = "INFO"
@@ -77,6 +81,10 @@ class Settings(BaseSettings):
             raise RuntimeError("SECRET_KEY must be a unique value of at least 32 characters")
         if not self.cors_origins or "*" in self.cors_origins:
             raise RuntimeError("CORS_ORIGINS must explicitly list the production frontend URL")
+        if self.storage_backend not in {"minio", "s3"}:
+            raise RuntimeError("STORAGE_BACKEND must be either 'minio' or 's3'")
+        if self.storage_backend == "s3" and not self.aws_s3_bucket:
+            raise RuntimeError("AWS_S3_BUCKET is required when STORAGE_BACKEND=s3")
 
 
 @lru_cache

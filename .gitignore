@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 !**/.env.example
+!**/.env.*.example
 
 # Python environments, caches, builds, and coverage
 .venv/
@@ -51,6 +52,8 @@ downloads/
 *.db
 *.dump
 *.sql.gz
+*.pem
+*.ppk
 postgres_data/
 redis_data/
 minio_data/

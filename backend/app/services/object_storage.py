@@ -1,9 +1,10 @@
 import asyncio
-from io import BytesIO
 from datetime import timedelta
+from io import BytesIO
 from urllib.parse import urlparse
 from uuid import UUID
 
+import boto3
 from minio import Minio
 
 from app.core.config import settings
@@ -19,20 +20,44 @@ def get_minio_client() -> Minio:
     )
 
 
+def get_s3_client():
+    return boto3.client("s3", region_name=settings.aws_region)
+
+
+def build_object_uri(object_name: str) -> str:
+    scheme = "s3" if settings.storage_backend == "s3" else "minio"
+    return f"{scheme}://{object_name.lstrip('/')}"
+
+
+def _object_location(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme not in {"minio", "s3"}:
+        raise ValidationError("Object URI must use minio:// or s3://")
+    object_name = "/".join(part for part in (parsed.netloc, parsed.path.lstrip("/")) if part)
+    parts = object_name.split("/")
+    if len(parts) < 2:
+        raise ValidationError("Object paths must start with a user ID")
+    try:
+        UUID(parts[0])
+    except ValueError as exc:
+        raise ValidationError("Object paths must start with a user ID") from exc
+    return parsed.scheme, object_name
+
+
 async def generate_presigned_url(uri: str, expires_seconds: int = 3600) -> str:
     parsed = urlparse(uri)
-    if parsed.scheme != "minio":
+    if parsed.scheme not in {"minio", "s3"}:
         return uri
-    object_name = "/".join(part for part in (parsed.netloc, parsed.path.lstrip("/")) if part)
-    path_parts = object_name.split("/")
-    if len(path_parts) < 2:
-        raise ValidationError("MinIO object paths must start with a user ID")
-    try:
-        UUID(path_parts[0])
-    except ValueError as exc:
-        raise ValidationError("MinIO object paths must start with a user ID") from exc
+    scheme, object_name = _object_location(uri)
     if expires_seconds != 3600:
-        raise ValidationError("MinIO presigned URLs must use a one-hour expiry")
+        raise ValidationError("Object presigned URLs must use a one-hour expiry")
+    if scheme == "s3":
+        return await asyncio.to_thread(
+            get_s3_client().generate_presigned_url,
+            "get_object",
+            Params={"Bucket": settings.aws_s3_bucket, "Key": object_name},
+            ExpiresIn=expires_seconds,
+        )
     client = get_minio_client()
     return await asyncio.to_thread(
         client.presigned_get_object,
@@ -42,23 +67,17 @@ async def generate_presigned_url(uri: str, expires_seconds: int = 3600) -> str:
     )
 
 
-def _object_name(uri: str) -> str:
-    parsed = urlparse(uri)
-    if parsed.scheme != "minio":
-        raise ValidationError("Object URI must use minio://")
-    object_name = "/".join(part for part in (parsed.netloc, parsed.path.lstrip("/")) if part)
-    parts = object_name.split("/")
-    if len(parts) < 2:
-        raise ValidationError("MinIO object paths must start with a user ID")
-    try:
-        UUID(parts[0])
-    except ValueError as exc:
-        raise ValidationError("MinIO object paths must start with a user ID") from exc
-    return object_name
-
-
 async def upload_object(uri: str, content: bytes, content_type: str) -> None:
-    object_name = _object_name(uri)
+    scheme, object_name = _object_location(uri)
+    if scheme == "s3":
+        await asyncio.to_thread(
+            get_s3_client().put_object,
+            Bucket=settings.aws_s3_bucket,
+            Key=object_name,
+            Body=content,
+            ContentType=content_type,
+        )
+        return
     client = get_minio_client()
     await asyncio.to_thread(
         client.put_object,
@@ -71,7 +90,22 @@ async def upload_object(uri: str, content: bytes, content_type: str) -> None:
 
 
 async def read_object(uri: str) -> bytes:
-    object_name = _object_name(uri)
+    scheme, object_name = _object_location(uri)
+    if scheme == "s3":
+        response = await asyncio.to_thread(
+            get_s3_client().get_object,
+            Bucket=settings.aws_s3_bucket,
+            Key=object_name,
+        )
+
+        def read_s3_body() -> bytes:
+            body = response["Body"]
+            try:
+                return body.read()
+            finally:
+                body.close()
+
+        return await asyncio.to_thread(read_s3_body)
     client = get_minio_client()
 
     def read() -> bytes:
@@ -86,7 +120,14 @@ async def read_object(uri: str) -> bytes:
 
 
 async def delete_object(uri: str) -> None:
-    object_name = _object_name(uri)
+    scheme, object_name = _object_location(uri)
+    if scheme == "s3":
+        await asyncio.to_thread(
+            get_s3_client().delete_object,
+            Bucket=settings.aws_s3_bucket,
+            Key=object_name,
+        )
+        return
     await asyncio.to_thread(
         get_minio_client().remove_object,
         settings.minio_bucket,

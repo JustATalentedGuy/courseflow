@@ -78,7 +78,7 @@ async def export_notes_markdown(
 
 
 async def refresh_presigned_image_urls(markdown: str) -> str:
-    pattern = re.compile(r"(!\[[^\]]*]\()(?P<uri>minio://[^)]+)(\))")
+    pattern = re.compile(r"(!\[[^\]]*]\()(?P<uri>(?:minio|s3)://[^)]+)(\))")
     matches = list(pattern.finditer(markdown))
     if not matches:
         return markdown

@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from app.services.object_storage import build_object_uri
+
 
 @dataclass(frozen=True)
 class ImagePlaceholder:
@@ -31,7 +33,7 @@ def extract_slide_screenshots(
     placeholders: list[ImagePlaceholder] = []
     for index, timestamp in enumerate(timestamps, start=1):
         token = f"{{{{IMG_{index:03d}}}}}"
-        url = f"minio://{user_id}/{video_id}/frames/{timestamp:.2f}.jpg"
+        url = build_object_uri(f"{user_id}/{video_id}/frames/{timestamp:.2f}.jpg")
         placeholders.append(
             ImagePlaceholder(
                 token=token,

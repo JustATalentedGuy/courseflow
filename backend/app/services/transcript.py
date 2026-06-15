@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,7 +16,12 @@ from groq import AsyncGroq
 from sqlalchemy import select
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
+from youtube_transcript_api import (
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+)
 
 from app.core.config import settings
 from app.core.exceptions import (
@@ -32,6 +38,13 @@ from app.models.video import Video
 from app.schemas.transcript import NormalisedTranscript, TranscriptSegment
 from app.services.external_api import call_external_async
 from app.services.quota import QuotaManager
+from app.services.youtube_access import (
+    build_transcript_api,
+    is_youtube_block_error,
+    redact_youtube_error,
+    ytdlp_proxy_args,
+    youtube_block_message,
+)
 
 logger = structlog.get_logger()
 
@@ -128,9 +141,9 @@ def _caption_segments_to_transcript(
     )
 
 
-def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None:
+def _fetch_youtube_captions_once(youtube_video_id: str) -> NormalisedTranscript | None:
     try:
-        transcript_list = YouTubeTranscriptApi().list(youtube_video_id)
+        transcript_list = build_transcript_api().list(youtube_video_id)
         try:
             transcript = transcript_list.find_manually_created_transcript(["en"])
         except NoTranscriptFound:
@@ -164,6 +177,18 @@ def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None
     )
 
 
+def fetch_youtube_captions(youtube_video_id: str) -> NormalisedTranscript | None:
+    attempts = 3 if settings.youtube_proxy_url else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return _fetch_youtube_captions_once(youtube_video_id)
+        except (RequestBlocked, IpBlocked):
+            if attempt == attempts:
+                raise
+            time.sleep(0.5 * attempt)
+    return None
+
+
 async def _ensure_whisper_quota(video: Video) -> None:
     del video
     if not settings.groq_api_key or settings.groq_api_key == "your_groq_key_here":
@@ -192,6 +217,7 @@ def _download_audio(video: Video, temp_path: Path) -> Path:
                 "5",
                 "--retry-sleep",
                 "exp=1:5",
+                *ytdlp_proxy_args(),
                 "--output",
                 output_template,
                 "--extract-audio",
@@ -213,7 +239,11 @@ def _download_audio(video: Video, temp_path: Path) -> Path:
             f"YouTube audio download timed out after {timeout_seconds} seconds"
         ) from exc
     if result.returncode != 0:
-        detail = result.stderr.strip().splitlines()
+        safe_error = redact_youtube_error(result.stderr.strip())
+        if is_youtube_block_error(safe_error):
+            error_type = TemporaryAPIError if settings.youtube_proxy_url else PermanentAPIError
+            raise error_type(youtube_block_message())
+        detail = safe_error.splitlines()
         suffix = f": {detail[-1]}" if detail else ""
         raise PermanentAPIError(f"YouTube audio download failed{suffix}")
 

@@ -155,10 +155,12 @@ def test_youtube_captions_normalise_correctly(monkeypatch):
         def find_manually_created_transcript(self, languages):
             return FakeTranscript()
 
-    monkeypatch.setattr(
-        "app.services.transcript.YouTubeTranscriptApi.list",
-        lambda self, video_id: FakeTranscriptList(),
-    )
+    fake_api = type(
+        "FakeYouTubeTranscriptApi",
+        (),
+        {"list": lambda self, video_id: FakeTranscriptList()},
+    )()
+    monkeypatch.setattr("app.services.transcript.build_transcript_api", lambda: fake_api)
 
     transcript = fetch_youtube_captions("abc123")
 

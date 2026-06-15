@@ -12,6 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import ValidationError
 from app.models.course import Course
 from app.models.video import Video
+from app.services.youtube_access import (
+    is_youtube_block_error,
+    redact_youtube_error,
+    ytdlp_proxy_args,
+    youtube_block_message,
+)
 
 logger = structlog.get_logger()
 
@@ -54,20 +60,22 @@ def parse_youtube_url(url: str) -> ParsedYouTubeUrl:
 
 
 def _extract_youtube_info(url: str) -> dict:
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--dump-single-json",
+        "--flat-playlist",
+        "--skip-download",
+        "--ignore-errors",
+        "--ignore-no-formats-error",
+        "--no-warnings",
+        *ytdlp_proxy_args(),
+        url,
+    ]
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "yt_dlp",
-                "--dump-single-json",
-                "--flat-playlist",
-                "--skip-download",
-                "--ignore-errors",
-                "--ignore-no-formats-error",
-                "--no-warnings",
-                url,
-            ],
+            command,
             capture_output=True,
             text=True,
             timeout=30,
@@ -75,6 +83,9 @@ def _extract_youtube_info(url: str) -> dict:
         )
     except subprocess.TimeoutExpired as exc:
         raise ValidationError("YouTube metadata request timed out after 30 seconds") from exc
+    stderr = redact_youtube_error(result.stderr.strip())
+    if not result.stdout.strip() and is_youtube_block_error(stderr):
+        raise ValidationError(youtube_block_message())
     if not result.stdout.strip():
         raise ValidationError("Unable to read YouTube URL. It may be private or unavailable.")
     try:

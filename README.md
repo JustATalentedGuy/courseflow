@@ -684,6 +684,7 @@ The user must explicitly start diagram generation.
 | `GROQ_API_KEY` | Groq authentication | Empty |
 | `GROQ_BATCH_ENABLED` | Allow optional paid Batch overflow | `false` |
 | `GROQ_DAILY_RESERVE_PERCENT` | Preserve part of daily token allowance | `0` |
+| `YOUTUBE_PROXY_URL` | Rotating residential HTTP proxy for cloud deployments | Empty |
 | `CLOUDFLARE_ACCOUNT_ID` | Workers AI account | Empty |
 | `CLOUDFLARE_API_TOKEN` | Workers AI token | Empty |
 | `CLOUDFLARE_DAILY_NEURON_BUDGET` | Local image-generation budget | `8000` |
@@ -927,6 +928,26 @@ YOUTUBE_AUDIO_DOWNLOAD_TIMEOUT_SECONDS_PER_MINUTE=6
 ```
 
 Increase the maximum only when the host connection or very long videos require it.
+
+### YouTube Blocks the Cloud Server
+
+YouTube commonly blocks AWS and other datacenter IP ranges for captions and audio
+with `RequestBlocked` or "Sign in to confirm you're not a bot." CourseFlow routes
+playlist metadata, captions, and audio through the same optional proxy:
+
+```dotenv
+YOUTUBE_PROXY_URL=http://username:password@proxy-host:port
+```
+
+Use a rotating residential HTTP proxy. Do not use a personal YouTube account's
+cookies: they are brittle across IP addresses and can put the account at risk.
+Keep the proxy URL only in `.env` or `.env.production`, never in Git. Recreate the
+backend and workers after changing it:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  up -d --force-recreate backend worker
+```
 
 ### Illustrative Diagrams Report `provider_unavailable`
 

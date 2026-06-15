@@ -8,7 +8,12 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 
 from app.core.config import settings
-from app.core.exceptions import GroqQuotaWaitError, ValidationError
+from app.core.exceptions import (
+    GroqQuotaWaitError,
+    PermanentAPIError,
+    TemporaryAPIError,
+    ValidationError,
+)
 from app.core.security import hash_password
 from app.models.course import Course
 from app.models.groq import GroqUsageEvent, WhisperTranscriptionChunk
@@ -30,6 +35,11 @@ from app.services.transcript import (
     _prepare_whisper_rows,
     _transcribe_chunk,
     transcribe_with_whisper,
+)
+from app.services.youtube_access import (
+    build_transcript_api,
+    redact_youtube_error,
+    ytdlp_proxy_args,
 )
 
 
@@ -127,6 +137,66 @@ def test_audio_download_uses_duration_aware_timeout_and_low_bitrate_format(
     assert captured["timeout"] == 360
     format_index = captured["command"].index("--format")
     assert captured["command"][format_index + 1] == "bestaudio[abr<=96]/bestaudio/best"
+
+
+def test_youtube_proxy_is_shared_by_captions_and_ytdlp(monkeypatch):
+    proxy_url = "http://proxy-user:proxy-password@proxy.example:8080"
+    monkeypatch.setattr(settings, "youtube_proxy_url", proxy_url)
+
+    api = build_transcript_api()
+
+    assert api._fetcher._http_client.proxies == {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+    assert ytdlp_proxy_args() == ["--proxy", proxy_url]
+
+
+def test_youtube_proxy_credentials_are_redacted(monkeypatch):
+    proxy_url = "http://proxy-user:proxy-password@proxy.example:8080"
+    monkeypatch.setattr(settings, "youtube_proxy_url", proxy_url)
+
+    message = redact_youtube_error(f"Unable to connect through {proxy_url}")
+
+    assert proxy_url not in message
+    assert "proxy-password" not in message
+    assert "<redacted-proxy>" in message
+
+
+def test_audio_block_without_proxy_is_actionable(monkeypatch, tmp_path):
+    video = SimpleNamespace(youtube_video_id="blocked-video", duration_seconds=60)
+    monkeypatch.setattr(settings, "youtube_proxy_url", "")
+    monkeypatch.setattr(
+        "app.services.transcript.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stderr="Sign in to confirm you\u2019re not a bot",
+            stdout="",
+        ),
+    )
+
+    with pytest.raises(PermanentAPIError, match="YOUTUBE_PROXY_URL"):
+        _download_audio(video, tmp_path)
+
+
+def test_audio_block_with_proxy_is_retryable_and_redacted(monkeypatch, tmp_path):
+    proxy_url = "http://proxy-user:proxy-password@proxy.example:8080"
+    video = SimpleNamespace(youtube_video_id="blocked-video", duration_seconds=60)
+    monkeypatch.setattr(settings, "youtube_proxy_url", proxy_url)
+    monkeypatch.setattr(
+        "app.services.transcript.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stderr=f"Sign in to confirm you're not a bot via {proxy_url}",
+            stdout="",
+        ),
+    )
+
+    with pytest.raises(TemporaryAPIError) as error:
+        _download_audio(video, tmp_path)
+
+    assert proxy_url not in str(error.value)
+    assert "proxy-password" not in str(error.value)
 
 
 def test_large_audio_is_split_without_full_file_decode(monkeypatch, tmp_path):

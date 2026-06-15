@@ -100,7 +100,22 @@ if (-not $keyLookup.Success) {
         --query "KeyMaterial" --output text)
     $keyDirectory = Split-Path -Parent $KeyOutputPath
     New-Item -ItemType Directory -Force -Path $keyDirectory | Out-Null
-    [IO.File]::WriteAllText($KeyOutputPath, $keyMaterial.Replace("`r`n", "`n"))
+    $keyText = ($keyMaterial | Out-String).Trim()
+    $header = "-----BEGIN OPENSSH PRIVATE KEY-----"
+    $footer = "-----END OPENSSH PRIVATE KEY-----"
+    if ($keyText.StartsWith($header) -and $keyText.EndsWith($footer)) {
+        $body = $keyText.Substring(
+            $header.Length,
+            $keyText.Length - $header.Length - $footer.Length
+        ) -replace "\s", ""
+        $wrappedBody = [regex]::Replace($body, ".{1,70}", '$0' + "`n").TrimEnd()
+        $keyText = "$header`n$wrappedBody`n$footer`n"
+    }
+    [IO.File]::WriteAllText(
+        $KeyOutputPath,
+        $keyText,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 }
 
 $bucketLookup = Invoke-AwsOptional s3api head-bucket --bucket $bucket

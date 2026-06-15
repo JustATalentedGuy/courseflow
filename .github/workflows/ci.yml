@@ -50,7 +50,7 @@ jobs:
       - name: Install backend dependencies
         working-directory: backend
         run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1+cpu
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
           python -m pip install -r requirements.txt
       - name: Check backend dependencies
         run: python -m pip check

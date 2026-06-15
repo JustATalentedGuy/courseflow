@@ -9,18 +9,50 @@ concurrency:
   group: courseflow-production
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ap-south-1
     steps:
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Allow this runner to use SSH
+        id: allow-ssh
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNNER_IP="$(curl --fail --silent --show-error https://checkip.amazonaws.com | tr -d '[:space:]')"
+          if [[ ! "$RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unable to determine the GitHub runner IPv4 address." >&2
+            exit 1
+          fi
+          RUNNER_CIDR="${RUNNER_IP}/32"
+          echo "runner_cidr=${RUNNER_CIDR}" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "${{ vars.AWS_SECURITY_GROUP_ID }}" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_CIDR"
+
       - name: Deploy through SSH
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
+          command_timeout: 45m
           script: |
+            set -euo pipefail
             cd ~/courseflow
             git fetch origin main
             git checkout main
@@ -29,3 +61,14 @@ jobs:
             docker compose --env-file .env.production -f docker-compose.production.yml run --rm migrate
             docker compose --env-file .env.production -f docker-compose.production.yml up -d --remove-orphans
             docker image prune -f
+
+      - name: Remove the runner SSH rule
+        if: always() && steps.allow-ssh.outputs.runner_cidr != ''
+        shell: bash
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "${{ vars.AWS_SECURITY_GROUP_ID }}" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${{ steps.allow-ssh.outputs.runner_cidr }}" || true

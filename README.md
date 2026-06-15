@@ -982,6 +982,8 @@ guide:
 - `deploy/Caddyfile.example` routes HTTPS traffic to the API and frontend.
 - `deploy/provision-aws.ps1` creates the tagged EC2, networking, Elastic IP,
   private S3, IAM role, and optional budget.
+- `deploy/configure-github-oidc.ps1` gives only this repository's `main` branch
+  permission to temporarily admit its current Actions runner to SSH.
 - `deploy/cloudwatch-agent.json` collects Docker logs and host CPU, memory, and
   disk metrics.
 - `.github/workflows/deploy.yml` performs migration-gated SSH deployments.
@@ -1041,6 +1043,29 @@ docker compose --env-file .env.production -f docker-compose.production.yml up -d
 Install the CloudWatch agent configuration from
 `deploy/cloudwatch-agent.json`. Verify the application over HTTPS, API health,
 private S3 access, worker queues, and automatic restart behavior.
+
+### 5. Configure GitHub Actions
+
+The production security group keeps SSH restricted to individual `/32`
+addresses. A GitHub-hosted runner therefore needs short-lived permission to add
+its own address for the duration of a deployment. Configure the repository-bound
+OIDC role without storing AWS access keys:
+
+```powershell
+.\deploy\configure-github-oidc.ps1
+```
+
+Set the two repository variables printed by the script:
+
+```powershell
+gh variable set AWS_DEPLOY_ROLE_ARN --body "<role-arn>"
+gh variable set AWS_SECURITY_GROUP_ID --body "<security-group-id>"
+```
+
+Also set `EC2_HOST` and `EC2_SSH_KEY` as repository secrets. On every push to
+`main`, the workflow exchanges GitHub's OIDC token for short-lived AWS
+credentials, permits only the active runner's IP on port 22, deploys, and
+removes that rule in an `always()` cleanup step.
 
 ## Claude Desktop MCP Integration
 

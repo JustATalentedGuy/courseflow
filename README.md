@@ -984,6 +984,8 @@ guide:
   private S3, IAM role, and optional budget.
 - `deploy/configure-github-oidc.ps1` gives only this repository's `main` branch
   permission to temporarily admit its current Actions runner to SSH.
+- `deploy/configure-cloudwatch-dashboard.ps1` creates the CPU, memory, disk, and
+  application-error dashboard from the tagged EC2 instance.
 - `deploy/cloudwatch-agent.json` collects Docker logs and host CPU, memory, and
   disk metrics.
 - `.github/workflows/deploy.yml` performs migration-gated SSH deployments.
@@ -1043,6 +1045,14 @@ docker compose --env-file .env.production -f docker-compose.production.yml up -d
 Install the CloudWatch agent configuration from
 `deploy/cloudwatch-agent.json`. Verify the application over HTTPS, API health,
 private S3 access, worker queues, and automatic restart behavior.
+
+Create or refresh the CloudWatch dashboard:
+
+```powershell
+.\deploy\configure-cloudwatch-dashboard.ps1
+```
+
+![CourseFlow CloudWatch dashboard](docs/images/cloudwatch-dashboard.png)
 
 ### 5. Configure GitHub Actions
 

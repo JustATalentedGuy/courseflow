@@ -115,7 +115,10 @@ def _caption_segments_to_transcript(
             text = getattr(caption, "text", "")
             start_value = getattr(caption, "start", 0)
             duration_value = getattr(caption, "duration", 0)
-        cleaned = clean_transcript_text(text)
+        try:
+            cleaned = clean_transcript_text(text)
+        except TranscriptValidationError:
+            continue
         if not cleaned:
             continue
         start = float(start_value)
@@ -126,7 +129,7 @@ def _caption_segments_to_transcript(
         segments.append(TranscriptSegment(start=start, end=end, text=cleaned, speaker=None))
 
     if not segments:
-        raise TranscriptValidationError("Transcript contains no valid segments")
+        raise TranscriptValidationError("Transcript contains no valid speech segments")
 
     full_text = _collapse_spaces(" ".join(segment.text for segment in segments))
     duration_seconds = max(segment.end for segment in segments)

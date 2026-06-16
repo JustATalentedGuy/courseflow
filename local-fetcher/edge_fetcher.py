@@ -4,17 +4,54 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
+from youtube_transcript_api import (
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    YouTubeTranscriptApi,
+)
+
+
+YOUTUBE_BLOCK_MARKERS = (
+    "requestblocked",
+    "ipblocked",
+    "youtube is blocking",
+    "too many requests",
+    "sign in to confirm",
+    "not a bot",
+    "http error 429",
+)
+
+
+class EdgeHTTPError(RuntimeError):
+    def __init__(self, method: str, path: str, status_code: int, body: str) -> None:
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"{method} {path} failed with HTTP {status_code}: {body}")
+
+    @property
+    def detail(self) -> str:
+        try:
+            parsed = json.loads(self.body)
+        except json.JSONDecodeError:
+            return self.body
+        detail = parsed.get("detail") if isinstance(parsed, dict) else None
+        return str(detail or self.body)
 
 
 def load_env(path: Path) -> None:
@@ -53,7 +90,7 @@ class EdgeClient:
                 return json.loads(data.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {path} failed with HTTP {exc.code}: {detail}") from exc
+            raise EdgeHTTPError(method, path, exc.code, detail) from exc
 
     def upload(self, upload_url: str, content: bytes, content_type: str) -> None:
         request = urllib.request.Request(
@@ -65,6 +102,46 @@ class EdgeClient:
         with urllib.request.urlopen(request, timeout=600) as response:
             if response.status not in {200, 201, 204}:
                 raise RuntimeError(f"Upload failed with HTTP {response.status}")
+
+
+class HeartbeatLoop:
+    def __init__(
+        self,
+        client: EdgeClient,
+        job: dict,
+        worker_id: str,
+        interval_seconds: int = 120,
+    ) -> None:
+        self.client = client
+        self.job = job
+        self.worker_id = worker_id
+        self.interval_seconds = interval_seconds
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def __enter__(self) -> "HeartbeatLoop":
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_seconds):
+            try:
+                self.client.request(
+                    "POST",
+                    f"/edge/jobs/{self.job['id']}/heartbeat",
+                    {
+                        "lease_token": self.job["lease_token"],
+                        "worker_id": self.worker_id,
+                    },
+                )
+            except Exception as exc:
+                print(f"Heartbeat failed for job {self.job['id']}: {exc}", file=sys.stderr)
 
 
 def parse_video_id(url: str) -> str | None:
@@ -89,6 +166,28 @@ def fetch_captions(youtube_video_id: str) -> tuple[str, list[dict]] | None:
     fetched = transcript.fetch()
     captions = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else list(fetched)
     return transcript.language_code, captions
+
+
+def is_unusable_caption_error(exc: EdgeHTTPError) -> bool:
+    if exc.status_code != 400:
+        return False
+    detail = exc.detail.lower()
+    return (
+        "empty after cleaning" in detail
+        or "no valid speech segments" in detail
+        or "no valid segments" in detail
+    )
+
+
+def is_youtube_block_error(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in YOUTUBE_BLOCK_MARKERS)
+
+
+def retry_delay_for(exc: BaseException) -> int:
+    if isinstance(exc, (RequestBlocked, IpBlocked)) or is_youtube_block_error(exc):
+        return random.randint(2 * 60 * 60, 6 * 60 * 60)
+    return 600
 
 
 def fetch_playlist_metadata(url: str) -> dict:
@@ -192,6 +291,43 @@ def idempotency_for(job: dict, suffix: str) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+def upload_audio_fallback(client: EdgeClient, worker_id: str, job: dict, youtube_video_id: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="courseflow-edge-audio-") as temp:
+        with HeartbeatLoop(client, job, worker_id):
+            audio_path = download_audio(job["youtube_url"], Path(temp))
+            content = audio_path.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            duration = probe_duration(audio_path)
+            init = client.request(
+                "POST",
+                f"/edge/jobs/{job['id']}/audio-upload",
+                {
+                    "lease_token": job["lease_token"],
+                    "content_type": "audio/mpeg",
+                    "size_bytes": len(content),
+                    "sha256": digest,
+                    "duration_seconds": duration,
+                    "idempotency_key": idempotency_for(job, "audio"),
+                },
+            )
+            if init is None:
+                raise RuntimeError("Audio upload initialization returned no payload")
+            client.upload(init["upload_url"], content, "audio/mpeg")
+            client.request(
+                "POST",
+                f"/edge/jobs/{job['id']}/audio-complete",
+                {
+                    "lease_token": job["lease_token"],
+                    "object_uri": init["object_uri"],
+                    "size_bytes": len(content),
+                    "sha256": digest,
+                    "duration_seconds": duration,
+                    "idempotency_key": idempotency_for(job, "audio"),
+                },
+            )
+    print(f"Uploaded fallback audio for {youtube_video_id}")
+
+
 def process_job(client: EdgeClient, worker_id: str, job: dict) -> None:
     lease_token = job["lease_token"]
     if job["job_type"] == "playlist_metadata":
@@ -214,73 +350,65 @@ def process_job(client: EdgeClient, worker_id: str, job: dict) -> None:
 
     try:
         captions = fetch_captions(youtube_video_id)
-    except TranscriptsDisabled:
+    except (NoTranscriptFound, TranscriptsDisabled):
+        captions = None
+    except (RequestBlocked, IpBlocked) as exc:
+        print(f"Caption fetch blocked for {youtube_video_id}; trying audio fallback.", file=sys.stderr)
         captions = None
 
     if captions is not None:
         language, segments = captions
-        client.request(
-            "POST",
-            f"/edge/jobs/{job['id']}/captions",
-            {
-                "lease_token": lease_token,
-                "language": language,
-                "segments": [
-                    {
-                        "start": float(segment.get("start", 0)),
-                        "duration": float(segment.get("duration", 0)),
-                        "text": segment.get("text", ""),
-                    }
-                    for segment in segments
-                ],
-                "idempotency_key": idempotency_for(job, f"captions:{language}"),
-            },
-        )
-        print(f"Uploaded captions for {youtube_video_id} ({len(segments)} segments)")
-        return
+        try:
+            client.request(
+                "POST",
+                f"/edge/jobs/{job['id']}/captions",
+                {
+                    "lease_token": lease_token,
+                    "language": language,
+                    "segments": [
+                        {
+                            "start": float(segment.get("start", 0)),
+                            "duration": float(segment.get("duration", 0)),
+                            "text": segment.get("text", ""),
+                        }
+                        for segment in segments
+                    ],
+                    "idempotency_key": idempotency_for(job, f"captions:{language}"),
+                },
+            )
+            print(f"Uploaded captions for {youtube_video_id} ({len(segments)} segments)")
+            return
+        except EdgeHTTPError as exc:
+            if not is_unusable_caption_error(exc):
+                raise
+            print(
+                f"Captions for {youtube_video_id} were unusable after cleaning; trying audio fallback.",
+                file=sys.stderr,
+            )
 
-    with tempfile.TemporaryDirectory(prefix="courseflow-edge-audio-") as temp:
-        audio_path = download_audio(job["youtube_url"], Path(temp))
-        content = audio_path.read_bytes()
-        digest = hashlib.sha256(content).hexdigest()
-        duration = probe_duration(audio_path)
-        init = client.request(
-            "POST",
-            f"/edge/jobs/{job['id']}/audio-upload",
-            {
-                "lease_token": lease_token,
-                "content_type": "audio/mpeg",
-                "size_bytes": len(content),
-                "sha256": digest,
-                "duration_seconds": duration,
-                "idempotency_key": idempotency_for(job, "audio"),
-            },
-        )
-        if init is None:
-            raise RuntimeError("Audio upload initialization returned no payload")
-        client.upload(init["upload_url"], content, "audio/mpeg")
-        client.request(
-            "POST",
-            f"/edge/jobs/{job['id']}/audio-complete",
-            {
-                "lease_token": lease_token,
-                "object_uri": init["object_uri"],
-                "size_bytes": len(content),
-                "sha256": digest,
-                "duration_seconds": duration,
-                "idempotency_key": idempotency_for(job, "audio"),
-            },
-        )
-        print(f"Uploaded fallback audio for {youtube_video_id}")
+    upload_audio_fallback(client, worker_id, job, youtube_video_id)
 
 
-def run_once(client: EdgeClient, worker_id: str, limit: int) -> int:
+def pause_between_jobs(min_seconds: float, max_seconds: float) -> None:
+    delay = random.uniform(min_seconds, max_seconds) if max_seconds > min_seconds else min_seconds
+    if delay > 0:
+        time.sleep(delay)
+
+
+def run_once(
+    client: EdgeClient,
+    worker_id: str,
+    limit: int,
+    job_pause_min_seconds: float = 45,
+    job_pause_max_seconds: float = 60,
+) -> int:
     response = client.request("POST", "/edge/jobs/claim", {"worker_id": worker_id, "limit": limit})
     jobs = [] if response is None else response.get("jobs", [])
-    for job in jobs:
+    for index, job in enumerate(jobs):
         try:
             process_job(client, worker_id, job)
-            time.sleep(5)
+            if index < len(jobs) - 1:
+                pause_between_jobs(job_pause_min_seconds, job_pause_max_seconds)
         except Exception as exc:
             print(f"Job {job['id']} failed: {exc}", file=sys.stderr)
             client.request(
@@ -289,7 +417,7 @@ def run_once(client: EdgeClient, worker_id: str, limit: int) -> int:
                 {
                     "lease_token": job["lease_token"],
                     "error_message": str(exc),
-                    "retry_after_seconds": 600,
+                    "retry_after_seconds": retry_delay_for(exc),
                     "permanent": False,
                 },
             )
@@ -302,6 +430,8 @@ def main() -> int:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=30)
     parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--job-pause-min-seconds", type=float, default=45)
+    parser.add_argument("--job-pause-max-seconds", type=float, default=60)
     args = parser.parse_args()
 
     load_env(Path(args.env_file))
@@ -314,10 +444,19 @@ def main() -> int:
     client = EdgeClient(api_url, token)
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     while True:
-        processed = run_once(client, worker_id, args.limit)
+        processed = run_once(
+            client,
+            worker_id,
+            args.limit,
+            args.job_pause_min_seconds,
+            args.job_pause_max_seconds,
+        )
         if args.once:
             return 0
-        time.sleep(5 if processed else args.poll_seconds)
+        if processed:
+            pause_between_jobs(args.job_pause_min_seconds, args.job_pause_max_seconds)
+        else:
+            time.sleep(args.poll_seconds)
 
 
 if __name__ == "__main__":

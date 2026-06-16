@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db
+from app.core.exceptions import ValidationError
 from app.models.user import User
 from app.schemas.course import (
     CourseCreate,
@@ -13,6 +14,7 @@ from app.schemas.course import (
     CourseResponse,
     CourseStatusResponse,
 )
+from app.schemas.edge import RequeueTranscriptsResponse
 from app.schemas.notes import VideoNotes
 from app.services.course_service import (
     delete_course,
@@ -21,6 +23,12 @@ from app.services.course_service import (
     list_courses,
 )
 from app.services.ingestion import ingest_playlist
+from app.services.edge_fetcher import (
+    create_metadata_edge_job,
+    edge_mode_enabled,
+    requeue_missing_transcripts,
+)
+from app.services.ingestion import parse_youtube_url
 from app.services.export import (
     export_anki_deck,
     export_course_notes_markdown,
@@ -38,8 +46,22 @@ async def create(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CourseResponse:
-    course = await ingest_playlist(payload.playlist_url, current_user.id, db)
-    dispatch_course_tasks.delay(str(course.id), str(current_user.id))
+    try:
+        course = await ingest_playlist(payload.playlist_url, current_user.id, db)
+        if edge_mode_enabled():
+            await requeue_missing_transcripts(db, current_user.id, course.id)
+        else:
+            dispatch_course_tasks.delay(str(course.id), str(current_user.id))
+    except ValidationError as exc:
+        if not edge_mode_enabled() or "YouTube blocks this server IP" not in str(exc):
+            raise
+        parsed = parse_youtube_url(payload.playlist_url)
+        course = await create_metadata_edge_job(
+            db,
+            current_user.id,
+            payload.playlist_url,
+            parsed.playlist_id,
+        )
     return CourseResponse.model_validate(course)
 
 
@@ -70,6 +92,16 @@ async def get_user_course_status(
 ) -> CourseStatusResponse:
     counts = await get_course_status(db, current_user.id, course_id)
     return CourseStatusResponse(**counts)
+
+
+@router.post("/{course_id}/transcripts/requeue", response_model=RequeueTranscriptsResponse)
+async def requeue_course_transcripts(
+    course_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RequeueTranscriptsResponse:
+    queued, skipped = await requeue_missing_transcripts(db, current_user.id, course_id)
+    return RequeueTranscriptsResponse(queued=queued, skipped=skipped)
 
 
 @router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)

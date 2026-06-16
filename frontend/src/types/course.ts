@@ -26,6 +26,9 @@ export interface CourseStatusResponse {
   processing: number;
   rate_limited: number;
   batch_processing: number;
+  waiting_for_metadata: number;
+  waiting_for_transcript: number;
+  transcribing: number;
   completed: number;
   failed: number;
   deferred: number;

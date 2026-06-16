@@ -4,7 +4,7 @@ import { Clock3, Download, Images } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { downloadFile } from "../api/client";
-import { getCourse, getCourseStatus } from "../api/courses";
+import { getCourse, getCourseStatus, requeueCourseTranscripts } from "../api/courses";
 import { generateCourseDiagrams, getCourseDiagramStatus } from "../api/diagrams";
 import { StatusChip } from "./StatusChip";
 
@@ -30,6 +30,8 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
   const [notesFormat, setNotesFormat] = useState<"markdown" | "pdf" | null>(null);
   const [diagramTracking, setDiagramTracking] = useState(false);
   const [diagramStarting, setDiagramStarting] = useState(false);
+  const [requeueing, setRequeueing] = useState(false);
+  const [requeueMessage, setRequeueMessage] = useState("");
   const courseQuery = useQuery({
     queryKey: ["course", courseId],
     queryFn: () => getCourse(courseId, ""),
@@ -40,10 +42,13 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
     refetchInterval: (query) => {
       const status = query.state.data;
       return status &&
-        status.pending +
+          status.pending +
           status.processing +
           (status.rate_limited ?? 0) +
-          (status.batch_processing ?? 0) === 0
+          (status.batch_processing ?? 0) +
+          (status.waiting_for_metadata ?? 0) +
+          (status.waiting_for_transcript ?? 0) +
+          (status.transcribing ?? 0) === 0
         ? false
         : pollIntervalMs;
     },
@@ -107,6 +112,19 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
     }
   }
 
+  async function requeueMissingTranscripts() {
+    setRequeueing(true);
+    setRequeueMessage("");
+    try {
+      const result = await requeueCourseTranscripts(courseId);
+      setRequeueMessage(`Queued ${result.queued} videos. Skipped ${result.skipped} with transcripts.`);
+      await statusQuery.refetch();
+      await courseQuery.refetch();
+    } finally {
+      setRequeueing(false);
+    }
+  }
+
   return (
     <div>
       <div className="mb-7 rounded-3xl bg-gradient-to-br from-slate-950 to-slate-800 p-7 text-white">
@@ -132,6 +150,14 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
             >
               <Images className="h-4 w-4" /> {diagramStarting ? "Discovering..." : "Generate Diagrams"}
             </button>
+            <button
+              onClick={requeueMissingTranscripts}
+              disabled={requeueing}
+              title="Queue videos without transcripts for the local fetcher"
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 disabled:opacity-50"
+            >
+              <Download className="h-4 w-4" /> {requeueing ? "Queueing..." : "Queue Missing Transcripts"}
+            </button>
           </div>
         </div>
         <h1 className="mt-2 text-3xl font-bold">{course.title}</h1>
@@ -149,6 +175,12 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
             {diagramStatus.data.failed ? `, ${diagramStatus.data.failed} failed` : ""}
           </p>
         ) : null}
+        {statusQuery.data?.waiting_for_transcript ? (
+          <p className="mt-4 text-sm text-sky-200">
+            {statusQuery.data.waiting_for_transcript} lessons are waiting for the local transcript fetcher.
+          </p>
+        ) : null}
+        {requeueMessage ? <p className="mt-3 text-sm text-slate-300">{requeueMessage}</p> : null}
       </div>
       <div className="space-y-3">
         {course.videos.map((video) => (
@@ -174,6 +206,12 @@ export function CourseProgress({ courseId, pollIntervalMs = 5000 }: { courseId: 
                 <p className="mt-2 flex items-center gap-1 text-xs text-indigo-700">
                   <Clock3 className="h-3 w-3" /> Billed Batch processing
                 </p>
+              ) : null}
+              {video.status === "waiting_for_transcript" ? (
+                <p className="mt-2 max-w-sm text-xs text-sky-700">Waiting for the local transcript fetcher.</p>
+              ) : null}
+              {video.status === "transcribing" ? (
+                <p className="mt-2 max-w-sm text-xs text-blue-700">Uploaded audio is being transcribed with Whisper.</p>
               ) : null}
               {video.status === "failed" && video.error_message ? (
                 <p className="mt-2 max-w-sm text-xs text-rose-700" title={video.error_message}>

@@ -35,3 +35,11 @@ export function deleteCourse(courseId: string, accessToken: string): Promise<voi
     accessToken,
   });
 }
+
+export function requeueCourseTranscripts(
+  courseId: string,
+): Promise<{ queued: number; skipped: number }> {
+  return request<{ queued: number; skipped: number }>(`/courses/${courseId}/transcripts/requeue`, {
+    method: "POST",
+  });
+}

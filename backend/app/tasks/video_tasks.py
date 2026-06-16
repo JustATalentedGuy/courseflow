@@ -13,12 +13,15 @@ from app.core.config import settings
 from app.core.exceptions import GroqQuotaWaitError, PermanentAPIError, TemporaryAPIError
 from app.db.session import AsyncSessionLocal
 from app.models.course import Course
+from app.models.edge import YouTubeEdgeJob
 from app.models.groq import GroqBatchJob, NoteGenerationChunk
 from app.models.video import Video
+from app.services.edge_fetcher import edge_mode_enabled, ensure_transcript_edge_job
 from app.services.embedder import embed_and_store_notes
 from app.services.groq_batch import TERMINAL_BATCH_STATES, poll_batch, submit_video_batch
 from app.services.notes_service import generate_notes_for_video, get_notes_for_video
-from app.services.transcript import extract_transcript, store_transcript
+from app.services.object_storage import delete_object
+from app.services.transcript import extract_transcript, store_transcript, transcribe_uploaded_audio
 from app.workers.celery_app import celery_app
 
 logger = structlog.get_logger()
@@ -85,6 +88,9 @@ async def _process_video(video_id: str, user_id: str, task_id: str) -> str:
         await db.commit()
 
         if video.transcript is None:
+            if edge_mode_enabled():
+                await ensure_transcript_edge_job(db, video)
+                return "waiting_for_transcript"
             transcript = await extract_transcript(video, db)
             await store_transcript(transcript, video, db)
 
@@ -153,6 +159,34 @@ async def _schedule_quota_retry(
     )
     if not celery_app.conf.task_always_eager:
         process_video_task.apply_async(args=[video_id, user_id], eta=scheduled_for)
+    return status, scheduled_for
+
+
+async def _schedule_uploaded_audio_retry(
+    video_id: str,
+    user_id: str,
+    exc: GroqQuotaWaitError,
+) -> tuple[str, datetime]:
+    now = datetime.now(UTC)
+    scheduled_for = (
+        get_next_midnight_utc()
+        if exc.window == "daily"
+        else now
+        + timedelta(
+            seconds=max(1, exc.retry_after)
+            + (int(hashlib.sha256(video_id.encode()).hexdigest()[:2], 16) % 3)
+        )
+    )
+    status = "deferred" if exc.window == "daily" else "rate_limited"
+    async with AsyncSessionLocal() as db:
+        video = await db.scalar(
+            select(Video).where(Video.id == UUID(video_id), Video.user_id == UUID(user_id))
+        )
+        if video is not None:
+            video.status = status
+            video.scheduled_for = scheduled_for
+            video.error_message = str(exc)
+            await db.commit()
     return status, scheduled_for
 
 
@@ -227,6 +261,96 @@ def process_video_task(self, video_id: str, user_id: str):
             duration_s=round(time.perf_counter() - started, 3),
             outcome="failed",
             error_type=type(exc).__name__,
+        )
+        return "failed"
+
+
+async def _process_uploaded_audio(video_id: str, user_id: str, job_id: str) -> str:
+    async with AsyncSessionLocal() as db:
+        video = await db.scalar(
+            select(Video)
+            .options(selectinload(Video.transcript))
+            .where(Video.id == UUID(video_id), Video.user_id == UUID(user_id))
+        )
+        job = await db.scalar(
+            select(YouTubeEdgeJob).where(
+                YouTubeEdgeJob.id == UUID(job_id),
+                YouTubeEdgeJob.video_id == UUID(video_id),
+                YouTubeEdgeJob.user_id == UUID(user_id),
+            )
+        )
+        if video is None or job is None:
+            raise PermanentAPIError("Uploaded audio job not found")
+        if video.transcript is not None:
+            return "completed"
+        if not job.audio_object_uri:
+            raise PermanentAPIError("Uploaded audio object is missing")
+        video.status = "transcribing"
+        video.error_message = None
+        await db.commit()
+        transcript = await transcribe_uploaded_audio(video, db, job.audio_object_uri)
+        await store_transcript(transcript, video, db)
+        job.state = "completed"
+        await db.commit()
+        try:
+            await delete_object(job.audio_object_uri)
+        except Exception:
+            logger.warning("edge.audio.cleanup.failed", job_id=job_id, object_uri=job.audio_object_uri)
+
+    async with AsyncSessionLocal() as db:
+        await generate_notes_for_video(db, UUID(user_id), UUID(video_id), quality="standard")
+
+    async with AsyncSessionLocal() as db:
+        video = await db.scalar(
+            select(Video).where(Video.id == UUID(video_id), Video.user_id == UUID(user_id))
+        )
+        if video is None:
+            raise PermanentAPIError("Video disappeared during uploaded audio processing")
+        await _store_note_chunks(video, user_id)
+    return "completed"
+
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    name="app.tasks.video_tasks.process_uploaded_audio_task",
+)
+def process_uploaded_audio_task(self, video_id: str, user_id: str, job_id: str):
+    started = time.perf_counter()
+    try:
+        outcome = _run(_process_uploaded_audio(video_id, user_id, job_id))
+        logger.info(
+            "edge.audio.processing.finished",
+            task_id=self.request.id,
+            video_id=video_id,
+            user_id=user_id,
+            job_id=job_id,
+            duration_s=round(time.perf_counter() - started, 3),
+            outcome=outcome,
+        )
+        return outcome
+    except GroqQuotaWaitError as exc:
+        status, scheduled_for = _run(_schedule_uploaded_audio_retry(video_id, user_id, exc))
+        process_uploaded_audio_task.apply_async(args=[video_id, user_id, job_id], eta=scheduled_for)
+        return status
+    except TemporaryAPIError as exc:
+        if self.request.retries >= self.max_retries:
+            _run(_set_video_failed(video_id, user_id, str(exc)))
+            return "failed"
+        raise self.retry(exc=exc, countdown=min(60 * (2**self.request.retries), 900))
+    except PermanentAPIError as exc:
+        _run(_set_video_failed(video_id, user_id, str(exc)))
+        return "failed"
+    except Exception as exc:
+        _run(_set_video_failed(video_id, user_id, str(exc)))
+        logger.exception(
+            "edge.audio.processing.finished",
+            task_id=self.request.id,
+            video_id=video_id,
+            user_id=user_id,
+            job_id=job_id,
+            duration_s=round(time.perf_counter() - started, 3),
+            outcome="failed",
         )
         return "failed"
     except Exception as exc:

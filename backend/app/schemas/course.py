@@ -40,6 +40,9 @@ class CourseStatusResponse(BaseModel):
     processing: int
     rate_limited: int
     batch_processing: int
+    waiting_for_metadata: int = 0
+    waiting_for_transcript: int = 0
+    transcribing: int = 0
     completed: int
     failed: int
     deferred: int

@@ -67,6 +67,33 @@ async def generate_presigned_url(uri: str, expires_seconds: int = 3600) -> str:
     )
 
 
+async def generate_presigned_upload_url(
+    uri: str,
+    content_type: str,
+    expires_seconds: int = 900,
+) -> str:
+    scheme, object_name = _object_location(uri)
+    if expires_seconds > 900:
+        raise ValidationError("Upload presigned URLs cannot exceed 15 minutes")
+    if scheme == "s3":
+        return await asyncio.to_thread(
+            get_s3_client().generate_presigned_url,
+            "put_object",
+            Params={
+                "Bucket": settings.aws_s3_bucket,
+                "Key": object_name,
+                "ContentType": content_type,
+            },
+            ExpiresIn=expires_seconds,
+        )
+    return await asyncio.to_thread(
+        get_minio_client().presigned_put_object,
+        settings.minio_bucket,
+        object_name,
+        expires=timedelta(seconds=expires_seconds),
+    )
+
+
 async def upload_object(uri: str, content: bytes, content_type: str) -> None:
     scheme, object_name = _object_location(uri)
     if scheme == "s3":

@@ -27,7 +27,7 @@ export function VideoDetailPage() {
     enabled: Boolean(id),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      return status && ["pending", "processing", "rate_limited", "batch_processing"].includes(status)
+      return status && ["pending", "processing", "rate_limited", "batch_processing", "waiting_for_transcript", "transcribing"].includes(status)
         ? 3000
         : false;
     },
@@ -110,6 +110,16 @@ export function VideoDetailPage() {
           <div className="rounded-3xl border border-slate-200 bg-white p-10 text-center">
             <h2 className="text-xl font-bold">This lesson is {video.data.status}</h2>
             <p className="mt-2 text-sm text-slate-500">Notes and quizzes appear here when processing completes.</p>
+            {video.data.status === "waiting_for_transcript" ? (
+              <p className="mx-auto mt-4 max-w-3xl rounded-2xl bg-sky-50 p-4 text-left text-sm text-sky-800">
+                This lesson is queued for the local transcript fetcher. Keep the Windows fetcher running on your home network.
+              </p>
+            ) : null}
+            {video.data.status === "transcribing" ? (
+              <p className="mx-auto mt-4 max-w-3xl rounded-2xl bg-blue-50 p-4 text-left text-sm text-blue-800">
+                The local fetcher uploaded audio and AWS is transcribing it with Whisper.
+              </p>
+            ) : null}
             {video.data.status === "failed" && video.data.error_message ? (
               <p className="mx-auto mt-4 max-w-3xl whitespace-pre-wrap rounded-2xl bg-rose-50 p-4 text-left text-sm text-rose-700">
                 {video.data.error_message}

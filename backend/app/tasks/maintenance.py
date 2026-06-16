@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.db.session import AsyncSessionLocal
 from app.models.diagram import DiagramAsset
+from app.models.edge import YouTubeEdgeJob
 from app.models.video import Video
 from app.services.object_storage import delete_object
 from app.workers.celery_app import celery_app
@@ -105,3 +106,31 @@ async def _cleanup_stale_diagram_objects() -> int:
 @celery_app.task(name="app.tasks.maintenance.cleanup_stale_diagram_objects")
 def cleanup_stale_diagram_objects():
     return _run(_cleanup_stale_diagram_objects())
+
+
+async def _cleanup_stale_edge_audio() -> int:
+    threshold = datetime.now(UTC) - timedelta(days=1)
+    async with AsyncSessionLocal() as db:
+        rows = list(
+            await db.scalars(
+                select(YouTubeEdgeJob).where(
+                    YouTubeEdgeJob.audio_object_uri.is_not(None),
+                    YouTubeEdgeJob.updated_at < threshold,
+                )
+            )
+        )
+        deleted = 0
+        for row in rows:
+            try:
+                await delete_object(row.audio_object_uri)
+                row.audio_object_uri = None
+                deleted += 1
+            except Exception:
+                logger.exception("edge.audio.cleanup.failed", job_id=str(row.id))
+        await db.commit()
+        return deleted
+
+
+@celery_app.task(name="app.tasks.maintenance.cleanup_stale_edge_audio")
+def cleanup_stale_edge_audio():
+    return _run(_cleanup_stale_edge_audio())

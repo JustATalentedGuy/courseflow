@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     groq_whisper_ash: int = 7200
     groq_whisper_asd: int = 28_800
     youtube_proxy_url: str = ""
+    youtube_fetch_mode: str = "server"
+    edge_fetcher_lease_seconds: int = 600
+    edge_fetcher_poll_limit: int = 1
+    edge_audio_max_upload_mb: int = 200
     youtube_audio_download_min_timeout_seconds: int = 120
     youtube_audio_download_max_timeout_seconds: int = 900
     youtube_audio_download_timeout_seconds_per_minute: int = 6

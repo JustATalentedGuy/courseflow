@@ -684,7 +684,8 @@ The user must explicitly start diagram generation.
 | `GROQ_API_KEY` | Groq authentication | Empty |
 | `GROQ_BATCH_ENABLED` | Allow optional paid Batch overflow | `false` |
 | `GROQ_DAILY_RESERVE_PERCENT` | Preserve part of daily token allowance | `0` |
-| `YOUTUBE_PROXY_URL` | Rotating residential HTTP proxy for cloud deployments | Empty |
+| `YOUTUBE_FETCH_MODE` | `edge` queues YouTube work for the local fetcher; `server` runs the legacy in-server path | `server` locally, `edge` in production |
+| `YOUTUBE_PROXY_URL` | Optional legacy HTTP proxy for local/development experiments | Empty |
 | `CLOUDFLARE_ACCOUNT_ID` | Workers AI account | Empty |
 | `CLOUDFLARE_API_TOKEN` | Workers AI token | Empty |
 | `CLOUDFLARE_DAILY_NEURON_BUDGET` | Local image-generation budget | `8000` |
@@ -931,23 +932,33 @@ Increase the maximum only when the host connection or very long videos require i
 
 ### YouTube Blocks the Cloud Server
 
-YouTube commonly blocks AWS and other datacenter IP ranges for captions and audio
-with `RequestBlocked` or "Sign in to confirm you're not a bot." CourseFlow routes
-playlist metadata, captions, and audio through the same optional proxy:
+YouTube commonly blocks AWS and other datacenter IP ranges for playlist metadata,
+captions, and audio with `RequestBlocked` or "Sign in to confirm you're not a bot."
+The production deployment avoids paid proxies by using a hybrid edge fetcher:
+AWS runs CourseFlow, while a small Windows process on your home network fetches
+YouTube-only data and submits it back through the HTTPS API.
 
-```dotenv
-YOUTUBE_PROXY_URL=http://username:password@proxy-host:port
-```
+1. In CourseFlow, open Settings and create a local transcript fetcher token.
+2. On your Windows machine, copy `local-fetcher/.env.edge-fetcher.example` to
+   `local-fetcher/.env.edge-fetcher`.
+3. Set:
 
-Use a rotating residential HTTP proxy. Do not use a personal YouTube account's
-cookies: they are brittle across IP addresses and can put the account at risk.
-Keep the proxy URL only in `.env` or `.env.production`, never in Git. Recreate the
-backend and workers after changing it:
+   ```dotenv
+   COURSEFLOW_API_URL=https://your-courseflow-domain
+   COURSEFLOW_EDGE_TOKEN=cfedge_...
+   ```
 
-```bash
-docker compose --env-file .env.production -f docker-compose.production.yml \
-  up -d --force-recreate backend worker
-```
+4. Install and start the scheduled task:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\local-fetcher\install-task.ps1
+   ```
+
+The fetcher claims pending jobs, retrieves captions with `youtube-transcript-api`,
+and uploads fallback audio only when captions are unavailable. The laptop needs to
+be awake for YouTube work; AWS keeps all jobs queued safely while it is offline.
+The old `YOUTUBE_PROXY_URL` remains available for development experiments, but it
+is not needed for the zero-extra-cost AWS deployment path.
 
 ### Illustrative Diagrams Report `provider_unavailable`
 
@@ -1050,6 +1061,7 @@ AWS_S3_BUCKET=<bucket-returned-by-provisioning>
 POSTGRES_PASSWORD=<strong-random-password>
 SECRET_KEY=<openssl-rand-hex-32-output>
 GROQ_API_KEY=<key>
+YOUTUBE_FETCH_MODE=edge
 ```
 
 Do not add AWS access keys. Containers obtain S3 credentials from the EC2 IAM

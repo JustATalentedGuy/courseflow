@@ -1,6 +1,7 @@
 from app.models.chunk import NoteChunk
 from app.models.course import Course
 from app.models.diagram import CloudflareUsageEvent, DiagramAsset
+from app.models.edge import EdgeFetcherToken, YouTubeEdgeJob
 from app.models.groq import (
     GroqBatchJob,
     GroqUsageEvent,
@@ -22,6 +23,7 @@ __all__ = [
     "GroqBatchJob",
     "GroqUsageEvent",
     "DiagramAsset",
+    "EdgeFetcherToken",
     "NoteChunk",
     "Notes",
     "NoteGenerationChunk",
@@ -30,4 +32,5 @@ __all__ = [
     "User",
     "Video",
     "WhisperTranscriptionChunk",
+    "YouTubeEdgeJob",
 ]

@@ -37,6 +37,7 @@ from app.models.groq import GroqUsageEvent, WhisperTranscriptionChunk
 from app.models.video import Video
 from app.schemas.transcript import NormalisedTranscript, TranscriptSegment
 from app.services.external_api import call_external_async
+from app.services.object_storage import delete_object, read_object
 from app.services.quota import QuotaManager
 from app.services.youtube_access import (
     build_transcript_api,
@@ -507,6 +508,121 @@ async def _prepare_whisper_rows(
     return existing
 
 
+async def _transcribe_audio_path(
+    video: Video,
+    db: AsyncSession,
+    audio_path: Path,
+    temp_path: Path,
+) -> NormalisedTranscript:
+    chunks = await asyncio.to_thread(_split_audio_if_needed, audio_path, temp_path)
+    client = AsyncGroq(api_key=settings.groq_api_key, max_retries=0)
+    quota = QuotaManager()
+    rows = await _prepare_whisper_rows(db, video, chunks)
+    chunk_segments: list[list[TranscriptSegment]] = []
+    try:
+        for chunk, row in zip(chunks, rows, strict=True):
+            if row.state == "completed" and row.segments_json:
+                chunk_segments.append(
+                    [
+                        TranscriptSegment.model_validate(segment)
+                        for segment in row.segments_json
+                    ]
+                )
+                continue
+
+            reservation = await quota.reserve_whisper(db, row.billable_seconds)
+            row.state = "processing"
+            row.retry_at = None
+            row.error_message = None
+            await db.commit()
+            try:
+                segments, headers, request_id = await _transcribe_chunk(client, chunk)
+            except Exception as exc:
+                await quota.release(reservation)
+                if getattr(exc, "status_code", None) == 429:
+                    wait_error = await quota.wait_from_headers(
+                        settings.groq_whisper_model,
+                        _error_headers(exc),
+                        _error_body(exc),
+                    )
+                    row.state = "rate_limited"
+                    row.retry_at = datetime.now(UTC) + timedelta(
+                        seconds=wait_error.retry_after
+                    )
+                    row.error_message = str(wait_error)
+                    await db.commit()
+                    raise wait_error from exc
+                row.state = "pending"
+                row.error_message = str(exc)
+                await db.commit()
+                raise
+
+            await quota.reconcile(
+                reservation,
+                headers=headers,
+                audio_seconds=row.billable_seconds,
+            )
+            row.state = "completed"
+            row.segments_json = [segment.model_dump() for segment in segments]
+            row.request_id = request_id
+            row.error_message = None
+            db.add(
+                GroqUsageEvent(
+                    model=settings.groq_whisper_model,
+                    user_id=video.user_id,
+                    video_id=video.id,
+                    course_id=video.course_id,
+                    mode="whisper",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    cached_tokens=0,
+                    charged_tokens=0,
+                    audio_seconds=row.billable_seconds,
+                    request_id=request_id or f"whisper-{row.id}",
+                )
+            )
+            await db.commit()
+            chunk_segments.append(segments)
+    finally:
+        await quota.close()
+        await client.close()
+
+    segments = _stitch_segments(chunk_segments)
+    if not segments:
+        raise TranscriptExtractionError("Whisper returned no transcript segments")
+
+    full_text = _collapse_spaces(" ".join(segment.text for segment in segments))
+    return NormalisedTranscript(
+        video_id=video.youtube_video_id,
+        source="groq_whisper",
+        language="en",
+        duration_seconds=max(segment.end for segment in segments),
+        segments=segments,
+        full_text=full_text,
+        word_count=len(full_text.split()),
+        fetched_at=datetime.now(UTC).isoformat(),
+    )
+
+
+async def transcribe_uploaded_audio(
+    video: Video,
+    db: AsyncSession,
+    object_uri: str,
+) -> NormalisedTranscript:
+    await _ensure_whisper_quota(video)
+
+    with tempfile.TemporaryDirectory(prefix="courseflow-whisper-") as temp_dir:
+        temp_path = Path(temp_dir)
+        try:
+            audio_path = temp_path / "edge_audio.mp3"
+            audio_path.write_bytes(await read_object(object_uri))
+            return await _transcribe_audio_path(video, db, audio_path, temp_path)
+        finally:
+            for path in temp_path.glob("*"):
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+
+
 async def transcribe_with_whisper(
     video: Video,
     db: AsyncSession,
@@ -517,95 +633,7 @@ async def transcribe_with_whisper(
         temp_path = Path(temp_dir)
         try:
             audio_path = await asyncio.to_thread(_download_audio, video, temp_path)
-            chunks = await asyncio.to_thread(_split_audio_if_needed, audio_path, temp_path)
-            client = AsyncGroq(api_key=settings.groq_api_key, max_retries=0)
-            quota = QuotaManager()
-            rows = await _prepare_whisper_rows(db, video, chunks)
-            chunk_segments: list[list[TranscriptSegment]] = []
-            try:
-                for chunk, row in zip(chunks, rows, strict=True):
-                    if row.state == "completed" and row.segments_json:
-                        chunk_segments.append(
-                            [
-                                TranscriptSegment.model_validate(segment)
-                                for segment in row.segments_json
-                            ]
-                        )
-                        continue
-
-                    reservation = await quota.reserve_whisper(db, row.billable_seconds)
-                    row.state = "processing"
-                    row.retry_at = None
-                    row.error_message = None
-                    await db.commit()
-                    try:
-                        segments, headers, request_id = await _transcribe_chunk(client, chunk)
-                    except Exception as exc:
-                        await quota.release(reservation)
-                        if getattr(exc, "status_code", None) == 429:
-                            wait_error = await quota.wait_from_headers(
-                                settings.groq_whisper_model,
-                                _error_headers(exc),
-                                _error_body(exc),
-                            )
-                            row.state = "rate_limited"
-                            row.retry_at = datetime.now(UTC) + timedelta(
-                                seconds=wait_error.retry_after
-                            )
-                            row.error_message = str(wait_error)
-                            await db.commit()
-                            raise wait_error from exc
-                        row.state = "pending"
-                        row.error_message = str(exc)
-                        await db.commit()
-                        raise
-
-                    await quota.reconcile(
-                        reservation,
-                        headers=headers,
-                        audio_seconds=row.billable_seconds,
-                    )
-                    row.state = "completed"
-                    row.segments_json = [segment.model_dump() for segment in segments]
-                    row.request_id = request_id
-                    row.error_message = None
-                    db.add(
-                        GroqUsageEvent(
-                            model=settings.groq_whisper_model,
-                            user_id=video.user_id,
-                            video_id=video.id,
-                            course_id=video.course_id,
-                            mode="whisper",
-                            prompt_tokens=0,
-                            completion_tokens=0,
-                            cached_tokens=0,
-                            charged_tokens=0,
-                            audio_seconds=row.billable_seconds,
-                            request_id=request_id or f"whisper-{row.id}",
-                        )
-                    )
-                    await db.commit()
-                    chunk_segments.append(segments)
-            finally:
-                await quota.close()
-                await client.close()
-
-            segments = _stitch_segments(chunk_segments)
-            if not segments:
-                raise TranscriptExtractionError("Whisper returned no transcript segments")
-
-            full_text = _collapse_spaces(" ".join(segment.text for segment in segments))
-            transcript = NormalisedTranscript(
-                video_id=video.youtube_video_id,
-                source="groq_whisper",
-                language="en",
-                duration_seconds=max(segment.end for segment in segments),
-                segments=segments,
-                full_text=full_text,
-                word_count=len(full_text.split()),
-                fetched_at=datetime.now(UTC).isoformat(),
-            )
-            return transcript
+            return await _transcribe_audio_path(video, db, audio_path, temp_path)
         finally:
             for path in temp_path.glob("*"):
                 if path.is_file():

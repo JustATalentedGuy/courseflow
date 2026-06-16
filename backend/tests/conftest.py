@@ -95,6 +95,8 @@ async def clean_state(migrated_database: None) -> AsyncGenerator[None, None]:
                     note_chunks,
                     cloudflare_usage_events,
                     diagram_assets,
+                    youtube_edge_jobs,
+                    edge_fetcher_tokens,
                     whisper_transcription_chunks,
                     groq_usage_events,
                     note_generation_chunks,

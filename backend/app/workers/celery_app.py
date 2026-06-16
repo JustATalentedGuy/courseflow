@@ -39,4 +39,8 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.maintenance.cleanup_stale_diagram_objects",
         "schedule": crontab(minute=30, hour=3),
     },
+    "cleanup-stale-edge-audio": {
+        "task": "app.tasks.maintenance.cleanup_stale_edge_audio",
+        "schedule": crontab(minute=45, hour="*/6"),
+    },
 }

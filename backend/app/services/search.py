@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 from sqlalchemy import distinct, select
@@ -7,6 +8,8 @@ from app.models.chunk import NoteChunk
 from app.models.video import Video
 from app.schemas.search import SearchResult
 from app.services.embedder import embed_texts
+
+QUERY_EMBEDDING_TIMEOUT_SECONDS = 90
 
 
 def _timestamp_url(youtube_video_id: str, start_seconds: float | None) -> str:
@@ -31,7 +34,18 @@ async def semantic_search(
         return []
 
     capped_top_k = min(max(top_k, 1), 20)
-    query_embedding = embed_texts([cleaned_query])[0]
+    try:
+        query_embedding = (
+            await asyncio.wait_for(
+                asyncio.to_thread(embed_texts, [cleaned_query]),
+                timeout=QUERY_EMBEDDING_TIMEOUT_SECONDS,
+            )
+        )[0]
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "CourseFlow search is still warming up the local embedding model. "
+            "Retry the same request in a minute."
+        ) from exc
     distance = NoteChunk.embedding.cosine_distance(query_embedding).label("distance")
 
     statement = (

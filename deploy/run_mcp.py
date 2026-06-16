@@ -12,12 +12,12 @@ def main() -> None:
             f"Missing {environment_file}. Copy .env.mcp.example to .env.mcp and configure it."
         )
 
-    for raw_line in environment_file.read_text(encoding="utf-8").splitlines():
+    for raw_line in environment_file.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip()
+        os.environ[key.strip().lstrip("\ufeff")] = value.strip()
 
     os.chdir(backend)
     sys.path.insert(0, str(backend))

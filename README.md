@@ -75,12 +75,14 @@ The primary workflow is:
 1. A user registers and submits a YouTube playlist or video URL.
 2. CourseFlow reads playlist metadata without downloading every video.
 3. Each video is placed on a background processing queue.
-4. YouTube captions are used when available.
-5. Videos without usable captions fall back to Groq Whisper transcription.
-6. The transcript is cleaned, validated, chunked, and saved.
-7. Groq generates structured Markdown notes from durable chunks.
-8. Notes are embedded locally and indexed in PostgreSQL with pgvector.
-9. The user can read, search, quiz, review, enrich, and export the course.
+4. In production, a local edge fetcher can perform YouTube-only work from a
+   residential IP and submit captions or audio back to the cloud.
+5. YouTube captions are used when available.
+6. Videos without usable captions fall back to Groq Whisper transcription.
+7. The transcript is cleaned, validated, chunked, and saved.
+8. Groq generates structured Markdown notes from durable chunks.
+9. Notes are embedded locally and indexed in PostgreSQL with pgvector.
+10. The user can read, search, quiz, review, enrich, and export the course.
 
 Processing is resumable. A worker restart or API rate limit does not force the
 system to repeat already completed note or Whisper chunks.
@@ -103,6 +105,11 @@ system to repeat already completed note or Whisper chunks.
 
 - Prefers manually authored English YouTube captions.
 - Falls back to generated English captions, then other available languages.
+- Supports a hybrid local fetcher for deployed systems where YouTube blocks cloud
+  IP ranges.
+- Leases edge transcript jobs durably so a laptop fetcher can stop and resume
+  without manual repair.
+- Falls back from unusable captions to local audio upload and server-side Whisper.
 - Uses Groq `whisper-large-v3-turbo` when captions are unavailable.
 - Downloads audio only when Whisper is required.
 - Uses duration-aware download timeouts for large videos.
@@ -324,7 +331,9 @@ flowchart TB
     User["Browser / React UI"] --> API["FastAPI REST API"]
     API --> Postgres["PostgreSQL + pgvector"]
     API --> Redis["Redis"]
-    API --> MinIO["MinIO object storage"]
+    API --> ObjectStore["MinIO locally / S3 in production"]
+    LocalFetcher["Local edge fetcher<br/>residential IP"] --> API
+    LocalFetcher --> YouTube["YouTube captions / yt-dlp audio"]
 
     API --> GeneralQueue["Celery default queue"]
     API --> DiagramQueue["Celery diagrams queue"]
@@ -334,15 +343,15 @@ flowchart TB
     GeneralQueue --> Worker["Transcript and notes workers"]
     DiagramQueue --> DiagramWorker["Low-concurrency diagram worker"]
 
-    Worker --> YouTube["YouTube captions / yt-dlp"]
     Worker --> Groq["Groq LLM and Whisper APIs"]
+    Worker --> ObjectStore
     Worker --> Postgres
     Worker --> Redis
 
     DiagramWorker --> Groq
     DiagramWorker --> Mermaid["Private Mermaid renderer"]
     DiagramWorker --> Cloudflare["Cloudflare Workers AI"]
-    DiagramWorker --> MinIO
+    DiagramWorker --> ObjectStore
     DiagramWorker --> Postgres
     DiagramWorker --> Redis
 ```
@@ -353,9 +362,13 @@ flowchart TB
 flowchart LR
     Submit["Submit playlist"] --> Ingest["Create course and videos"]
     Ingest --> Queue["Queue videos in playlist order"]
-    Queue --> Captions{"Captions available?"}
+    Queue --> Edge{"Production edge mode?"}
+    Edge -->|Yes| Lease["Local fetcher leases job"]
+    Edge -->|No| Captions
+    Lease --> Captions{"Captions usable?"}
     Captions -->|Yes| Normalize["Normalize transcript"]
-    Captions -->|No| Whisper["Durable Whisper chunks"]
+    Captions -->|No| Audio["Upload audio if needed"]
+    Audio --> Whisper["Durable Whisper chunks"]
     Whisper --> Normalize
     Normalize --> Notes["Durable note chunks"]
     Notes --> Embed["Local embeddings"]
@@ -379,6 +392,14 @@ independently through Redis-backed queues.
 General course processing and diagram rendering use different queues and
 concurrency settings. Expensive image work cannot occupy transcript workers or
 delay the core learning pipeline.
+
+### Hybrid Edge/Cloud Boundary
+
+The deployed application keeps durable state, AI processing, storage, and the UI
+in AWS, while a small local fetcher handles only the YouTube calls that are
+sensitive to datacenter IP blocking. This avoids paid proxies, keeps cloud costs
+low, and gives the system an explicit recovery model for a laptop process that
+may come and go.
 
 ### Durable Checkpointing
 
@@ -413,6 +434,7 @@ optional enrichment continues.
 ### Tiered Fallbacks
 
 - Captions before paid or limited transcription.
+- Local edge fetching before paid proxies for YouTube's cloud-IP restrictions.
 - Automatic Scout notes before explicit 70B regeneration.
 - Mermaid before raster generation for precise technical visuals.
 - LLM quiz evaluation with a local semantic fallback.
@@ -861,7 +883,7 @@ docker compose build
 
 At the time of this README update, the verified baseline is:
 
-- 134 backend tests passing
+- 151 backend tests passing
 - 16 frontend tests passing
 - Frontend type checking passing
 - Frontend production build passing
@@ -891,7 +913,7 @@ available at `/docs`.
 
 - CourseFlow stores user accounts, course metadata, transcripts, notes, learning
   history, usage ledgers, and generated asset references in PostgreSQL.
-- Generated images are stored in the configured private MinIO bucket.
+- Generated images are stored in the configured private MinIO or S3 bucket.
 - Redis stores task transport data, quota reservations, refresh-token state, active
   quizzes, and short-lived coordination data.
 - Passwords are hashed with bcrypt.
@@ -1119,8 +1141,10 @@ CourseFlow includes a local read-only stdio MCP server with three tools:
 - `ask_my_courses`
 
 The server runs on the laptop and connects to the deployed PostgreSQL database.
-Every query is scoped to `COURSEFLOW_MCP_USER_ID`. The answer tool retrieves
-course excerpts first and returns timestamped sources.
+Every query is scoped to `COURSEFLOW_MCP_USER_ID`. The list tool reads course
+metadata, the search tool retrieves timestamped course excerpts with lightweight
+database ranking, and the answer tool asks Groq to answer only from those
+retrieved excerpts.
 
 Create its ignored environment file:
 
@@ -1131,6 +1155,20 @@ Copy-Item backend\.env.mcp.example backend\.env.mcp
 Set the deployed database URL, the UUID of the CourseFlow user to expose, and
 the Groq key. Keep PostgreSQL port `5432` restricted to the current public IP in
 `courseflow-sg`.
+
+The database URL is built from the deployed `.env.production` values:
+
+```dotenv
+DATABASE_URL=postgresql+asyncpg://<postgres-user>:<url-encoded-password>@<elastic-ip-or-domain>:5432/<postgres-db>
+```
+
+Find the user UUID from the deployed database:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  exec -T postgres psql -U courseflow -d courseflow \
+  -c "select id, email, created_at from users order by created_at desc;"
+```
 
 Merge `deploy/claude_desktop_config.example.json` into:
 
@@ -1143,6 +1181,16 @@ environment's `python.exe` and `deploy\run_mcp.py`, restart Claude Desktop, and
 invoke `list_my_courses`. On startup, the MCP server reports
 a targeted diagnostic when EC2 is stopped or the current IP is no longer
 allowed by the security group.
+
+On the Microsoft Store build of Claude Desktop, the active config may be under:
+
+```text
+%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json
+```
+
+Claude rejects JSON files saved with a UTF-8 BOM. If the app logs
+`Unexpected token` while reading the config, rewrite the file as UTF-8 without
+BOM and fully restart Claude Desktop.
 
 ## License
 

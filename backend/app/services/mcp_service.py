@@ -1,14 +1,56 @@
+import asyncio
+import re
 from uuid import UUID
 
 from groq import AsyncGroq
-from sqlalchemy import case, func, select
+from sqlalchemy import case, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.chunk import NoteChunk
 from app.models.course import Course
 from app.models.video import Video
-from app.services.search import semantic_search
+
+MCP_GROQ_TIMEOUT_SECONDS = 60
+MCP_SEARCH_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "between",
+    "difference",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "of",
+    "or",
+    "the",
+    "to",
+    "what",
+    "with",
+}
+
+
+def _timestamp_url(youtube_video_id: str, start_seconds: float | None) -> str:
+    return f"https://youtube.com/watch?v={youtube_video_id}&t={int(start_seconds or 0)}s"
+
+
+def _mcp_search_terms(query: str) -> list[str]:
+    terms = []
+    for token in re.findall(r"[a-zA-Z0-9+#.\-]+", query.lower()):
+        cleaned = token.strip(".-")
+        if len(cleaned) < 2 or cleaned in MCP_SEARCH_STOP_WORDS:
+            continue
+        if cleaned not in terms:
+            terms.append(cleaned)
+    return terms[:8]
+
+
+def _postgres_word_pattern(term: str) -> str:
+    return rf"\m{re.escape(term)}\M"
 
 
 def configured_mcp_user_id() -> UUID:
@@ -79,24 +121,49 @@ async def search_courses_for_mcp(
     if await db.scalar(available) is None:
         return []
 
-    results = await semantic_search(
-        query=query,
-        user_id=str(user_id),
-        course_id=course_id,
-        top_k=min(max(limit, 1), 10),
-        db=db,
+    terms = _mcp_search_terms(query)
+    if not terms:
+        terms = [query.strip().lower()]
+    filters = []
+    rank_parts = []
+    for term in terms:
+        pattern = _postgres_word_pattern(term)
+        term_filter = or_(
+            NoteChunk.text.op("~*")(pattern),
+            NoteChunk.section_heading.op("~*")(pattern),
+            Video.title.op("~*")(pattern),
+        )
+        filters.append(term_filter)
+        rank_parts.extend(
+            [
+                case((Video.title.op("~*")(pattern), 3), else_=0),
+                case((NoteChunk.section_heading.op("~*")(pattern), 2), else_=0),
+                case((NoteChunk.text.op("~*")(pattern), 1), else_=0),
+            ]
+        )
+    rank = sum(rank_parts).label("rank")
+    statement = (
+        select(NoteChunk, Video, rank)
+        .join(Video, Video.id == NoteChunk.video_id)
+        .where(NoteChunk.user_id == user_id, or_(*filters))
+        .order_by(desc(rank), Video.position.asc(), NoteChunk.chunk_index.asc())
+        .limit(min(max(limit, 1), 10))
     )
+    if course_id is not None:
+        statement = statement.where(NoteChunk.course_id == UUID(course_id))
+    rows = (await db.execute(statement)).all()
+    max_rank = max((int(row.rank or 0) for row in rows), default=1)
     return [
         {
-            "course_id": result.course_id,
-            "video_id": result.video_id,
-            "video_title": result.video_title,
-            "section_heading": result.section_heading,
-            "text": result.text,
-            "similarity_score": result.similarity_score,
-            "timestamp_url": result.timestamp_url,
+            "course_id": str(chunk.course_id),
+            "video_id": str(video.id),
+            "video_title": video.title,
+            "section_heading": chunk.section_heading or "",
+            "text": chunk.text,
+            "similarity_score": round(float(row_rank or 0) / max_rank, 4),
+            "timestamp_url": _timestamp_url(video.youtube_video_id, chunk.start_seconds),
         }
-        for result in results
+        for chunk, video, row_rank in rows
     ]
 
 
@@ -134,24 +201,36 @@ async def ask_courses_for_mcp(
             raise RuntimeError("GROQ_API_KEY is required for ask_my_courses")
         client = AsyncGroq(api_key=settings.groq_api_key, max_retries=0)
 
-    response = await client.chat.completions.create(
-        model=settings.groq_auto_model,
-        temperature=0.2,
-        max_completion_tokens=900,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Answer only from the supplied CourseFlow excerpts. "
-                    "Cite supporting excerpts using [1], [2], and so on. "
-                    "If the excerpts are insufficient, say what is missing."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {question.strip()}\n\nCourseFlow excerpts:\n{context}",
-            },
-        ],
-    )
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.groq_auto_model,
+                temperature=0.2,
+                max_completion_tokens=900,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Answer only from the supplied CourseFlow excerpts. "
+                            "Cite supporting excerpts using [1], [2], and so on. "
+                            "If the excerpts are insufficient, say what is missing."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {question.strip()}\n\nCourseFlow excerpts:\n{context}",
+                    },
+                ],
+            ),
+            timeout=MCP_GROQ_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return {
+            "answer": (
+                "I found relevant CourseFlow excerpts, but the LLM answer step timed out. "
+                "Use the returned sources to answer manually or retry the same question."
+            ),
+            "sources": sources,
+        }
     answer = response.choices[0].message.content or ""
     return {"answer": answer.strip(), "sources": sources}
